@@ -14,7 +14,8 @@ class ArxivProvider:
     async def search(
             self,
             query: str,
-            max_results: int = 5
+            max_results: int = 5,
+            sort_by: str = "submitteddate"
     ) -> List[Dict[str, Any]]:
         """
         Search arXiv for papers matching the query.
@@ -22,15 +23,25 @@ class ArxivProvider:
         Args:
             query: Search query string
             max_results: Maximum number of results to return
+            sort_by: How to sort results - "relevance", "lastUpdatedDate", or "submittedDate"
             
         Returns:
-            List of paper metadata dictionaries
+            Dictionary containing:
+            - results: List of paper metadata dictionaries
+            - total_count: Total number of matching papers (if available)
         """
+        # Map sort_by string to arxiv library's SortCriterion
+        sort_criterion = {
+            "relevance": arxiv.SortCriterion.Relevance,
+            "lastupdateddate": arxiv.SortCriterion.LastUpdatedDate,
+            "submitteddate": arxiv.SortCriterion.SubmittedDate
+        }.get(sort_by.lower(), arxiv.SortCriterion.SubmittedDate)
+        
         # Create the search query
         search = arxiv.Search(
             query=query,
             max_results=max_results,
-            sort_by=arxiv.SortCriterion.Relevance
+            sort_by=sort_criterion
         )
         
         # Execute the search and get results
@@ -54,7 +65,19 @@ class ArxivProvider:
             }
             results.append(paper_dict)
         
-        return results
+        # Try to get total count of matching papers
+        total_results_count = None
+        try:
+            # The search object might have metadata about total results
+            total_results_count = search.total_results
+        except AttributeError:
+            # If not available directly, we can only report what we have
+            total_results_count = len(results)
+        
+        return {
+            "results": results,
+            "total_count": total_results_count
+        }
     
     async def get_paper_by_id(self, paper_id: str) -> Dict[str, Any]:
         """

@@ -43,6 +43,7 @@ if not logger.handlers:
 class QueryType(Enum):
     SEARCH = "search"          # Search for papers on a topic
     PAPER_DETAIL = "detail"    # Get details about a specific paper
+    AUTHOR_PROFILE = "author"  # Get details about an author
     FOLLOWUP = "followup"      # Follow-up question about previous results
     AGENT_INFO = "agent_info"  # Questions about the agent itself
     GREETING = "greeting"      # Hello, hi, etc.
@@ -55,6 +56,39 @@ INAPPROPRIATE_WORDS = [
     # Add more inappropriate words as needed
 ]
 
+# List of valid arXiv categories
+VALID_ARXIV_CATEGORIES = [
+    # Computer Science
+    "cs.AI", "cs.AR", "cs.CC", "cs.CE", "cs.CG", "cs.CL", "cs.CR", "cs.CV", 
+    "cs.CY", "cs.DB", "cs.DC", "cs.DL", "cs.DM", "cs.DS", "cs.ET", "cs.FL", 
+    "cs.GL", "cs.GR", "cs.GT", "cs.HC", "cs.IR", "cs.IT", "cs.LG", "cs.LO", 
+    "cs.MA", "cs.MM", "cs.MS", "cs.NA", "cs.NE", "cs.NI", "cs.OH", "cs.OS", 
+    "cs.PF", "cs.PL", "cs.RO", "cs.SC", "cs.SD", "cs.SE", "cs.SI", "cs.SY",
+    
+    # Mathematics
+    "math.AC", "math.AG", "math.AP", "math.AT", "math.CA", "math.CO", "math.CT", 
+    "math.CV", "math.DG", "math.DS", "math.FA", "math.GM", "math.GN", "math.GR", 
+    "math.GT", "math.HO", "math.IT", "math.KT", "math.LO", "math.MG", "math.MP", 
+    "math.NA", "math.NT", "math.OA", "math.OC", "math.PR", "math.QA", "math.RA", 
+    "math.RT", "math.SG", "math.SP", "math.ST",
+    
+    # Physics
+    "physics.acc-ph", "physics.ao-ph", "physics.atm-clus", "physics.atom-ph", 
+    "physics.bio-ph", "physics.chem-ph", "physics.class-ph", "physics.comp-ph", 
+    "physics.data-an", "physics.flu-dyn", "physics.gen-ph", "physics.geo-ph", 
+    "physics.hist-ph", "physics.ins-det", "physics.med-ph", "physics.optics", 
+    "physics.plasm-ph", "physics.pop-ph", "physics.soc-ph", "physics.space-ph",
+    
+    # Quantitative Biology
+    "q-bio.BM", "q-bio.CB", "q-bio.GN", "q-bio.MN", "q-bio.NC", "q-bio.OT", "q-bio.PE", "q-bio.QM", "q-bio.SC", "q-bio.TO",
+    
+    # Quantitative Finance
+    "q-fin.CP", "q-fin.EC", "q-fin.GN", "q-fin.MF", "q-fin.PM", "q-fin.PR", "q-fin.RM", "q-fin.ST", "q-fin.TR",
+    
+    # Statistics
+    "stat.AP", "stat.CO", "stat.ME", "stat.ML", "stat.OT", "stat.TH"
+]
+
 # Define tools that the agent can use
 class Tools:
     @staticmethod
@@ -65,7 +99,8 @@ class Tools:
         author: str = None,
         topic: str = None,
         date_range: str = None,
-        sort_by: str = "relevance"
+        sort_by: str = None,
+        category: str = None
     ) -> Dict[str, Any]:
         """
         Enhanced search for papers on arXiv with additional filters.
@@ -77,12 +112,13 @@ class Tools:
             author: Optional author name to filter results
             topic: Optional topic/category to filter results
             date_range: Optional date range for filtering (e.g., "last_month")
-            sort_by: How to sort results (relevance, date, etc.)
+            sort_by: How to sort results - "relevance", "lastUpdatedDate", or "submittedDate"
+            category: Optional arXiv category code to filter results (e.g., "cs.AI")
             
         Returns:
-            Dictionary with search results
+            Dictionary with search results including total count
         """
-        logger.info(f"[TOOL] search_papers called with query: '{query}', author: '{author}', topic: '{topic}'")
+        logger.info(f"[TOOL] search_papers called with query: '{query}', author: '{author}', topic: '{topic}', sort_by: '{sort_by}', category: '{category}'")
         
         # Ensure session metadata exists
         if not hasattr(session, "metadata") or session.metadata is None:
@@ -103,7 +139,17 @@ class Tools:
             search_params.append(formatted_author)
             logger.info(f"[TOOL] Added author filter: {formatted_author}")
         
-        # Add topic/category filter if provided
+        # Add category filter if provided
+        if category:
+            # Format category for arXiv search (ensuring it's a valid category code)
+            if category in VALID_ARXIV_CATEGORIES:
+                formatted_category = f'cat:{category}'
+                search_params.append(formatted_category)
+                logger.info(f"[TOOL] Added category filter: {formatted_category}")
+            else:
+                logger.warning(f"[TOOL] Invalid category code: {category}")
+        
+        # Add topic/category filter if provided (legacy support)
         if topic:
             # Format topic for arXiv search
             formatted_topic = f'cat:{topic}'
@@ -113,11 +159,34 @@ class Tools:
         # Add date range filter if provided
         if date_range:
             # Convert friendly date range to arXiv format
-            # This is a simplification - actual implementation would need more logic
-            if date_range == "last_month":
-                # Logic to calculate date from last month
+            if date_range == "last_day":
+                search_params.append("submittedDate:[NOW-1DAY TO NOW]")
+            elif date_range == "last_week":
+                search_params.append("submittedDate:[NOW-7DAYS TO NOW]")
+            elif date_range == "last_month":
                 search_params.append("submittedDate:[NOW-1MONTH TO NOW]")
-                logger.info(f"[TOOL] Added date range filter: {date_range}")
+            elif date_range == "last_year":
+                search_params.append("submittedDate:[NOW-1YEAR TO NOW]")
+            # Support for custom date ranges (YYYY-MM-DD format)
+            elif "to" in date_range.lower():
+                try:
+                    start_date, end_date = date_range.lower().split("to")
+                    start_date = start_date.strip()
+                    end_date = end_date.strip()
+                    # Validate and format dates (implementation omitted)
+                    search_params.append(f"submittedDate:[{start_date} TO {end_date}]")
+                except Exception as e:
+                    logger.error(f"[TOOL] Error parsing custom date range: {str(e)}")
+            
+            logger.info(f"[TOOL] Added date range filter: {date_range}")
+        
+        # Use the provided sort_by parameter if available
+        if sort_by:
+            logger.info(f"[TOOL] Using provided sort order: {sort_by}")
+        else:
+            # Default to most recent papers (submittedDate)
+            sort_by = "submitteddate"
+            logger.info(f"[TOOL] Using default sort order: {sort_by}")
         
         # Combine all search parameters
         if search_params:
@@ -135,12 +204,15 @@ class Tools:
         
         # Perform search
         try:
-            # Removed the sort_by parameter since ArxivProvider.search() doesn't accept it
-            search_results = await agent._arxiv_provider.search(
+            search_response = await agent._arxiv_provider.search(
                 combined_query, 
-                max_results=5
+                max_results=5,
+                sort_by=sort_by
             )
-            logger.info(f"[TOOL] search_papers found {len(search_results)} results")
+            search_results = search_response["results"]
+            total_count = search_response["total_count"]
+            
+            logger.info(f"[TOOL] search_papers found {len(search_results)} results (total: {total_count})")
             
             # Log paper titles and IDs for debugging
             for i, paper in enumerate(search_results[:3]):
@@ -158,7 +230,8 @@ class Tools:
                     "author": author,
                     "topic": topic,
                     "date_range": date_range,
-                    "sort_by": sort_by
+                    "sort_by": sort_by,
+                    "category": category
                 }
                 
                 # Ensure we're storing the session metadata persistently
@@ -172,9 +245,12 @@ class Tools:
                     "filters": {
                         "author": author,
                         "topic": topic,
-                        "date_range": date_range
+                        "date_range": date_range,
+                        "sort_by": sort_by,
+                        "category": category
                     },
                     "count": len(search_results),
+                    "total_count": total_count,
                     "results": search_results
                 }
             else:
@@ -185,9 +261,12 @@ class Tools:
                     "filters": {
                         "author": author,
                         "topic": topic,
-                        "date_range": date_range
+                        "date_range": date_range,
+                        "sort_by": sort_by,
+                        "category": category
                     },
                     "count": 0,
+                    "total_count": 0,
                     "results": []
                 }
         except Exception as e:
@@ -199,10 +278,124 @@ class Tools:
                 "filters": {
                     "author": author,
                     "topic": topic,
-                    "date_range": date_range
+                    "date_range": date_range,
+                    "sort_by": sort_by,
+                    "category": category
                 },
                 "count": 0,
+                "total_count": 0,
                 "results": [],
+                "error": str(e)
+            }
+    
+    @staticmethod
+    async def get_author_profile(
+        author_name: str, 
+        session: Session, 
+        agent: 'ArxivResearchAgent',
+        max_papers: int = 10
+    ) -> Dict[str, Any]:
+        """
+        Get detailed information about an author and their publication history.
+        
+        Args:
+            author_name: Name of the author to look up
+            session: Session information
+            agent: The ArxivResearchAgent instance
+            max_papers: Maximum number of papers to retrieve
+            
+        Returns:
+            Dictionary with author profile and papers
+        """
+        logger.info(f"[TOOL] get_author_profile called with author: '{author_name}'")
+        
+        # Ensure session metadata exists
+        if not hasattr(session, "metadata") or session.metadata is None:
+            session.metadata = {'client_id': 'default_user'}
+            logger.info("[SESSION] Initialized empty session metadata")
+        
+        # Format the author query for arXiv
+        author_query = f'au:"{author_name}"'
+        logger.info(f"[TOOL] Author search query: {author_query}")
+        
+        try:
+            # Search for papers by this author
+            # Sort by submitted date to get the most recent papers first
+            search_response = await agent._arxiv_provider.search(
+                author_query, 
+                max_results=max_papers,
+                sort_by="submittedDate"
+            )
+            
+            # Extract papers from response
+            author_papers = search_response["results"]
+            papers_found = len(author_papers)
+            logger.info(f"[TOOL] Found {papers_found} papers by author '{author_name}'")
+            
+            # Extract categories to determine research interests
+            categories = {}
+            co_authors = set()
+            years = {}
+            
+            # Process the papers to extract additional information
+            for paper in author_papers:
+                # Track categories/research areas
+                for category in paper.get('categories', []):
+                    categories[category] = categories.get(category, 0) + 1
+                
+                # Track co-authors
+                for author in paper.get('authors', []):
+                    if author != author_name:
+                        co_authors.add(author)
+                        
+                # Track publication years
+                year = paper.get('published', '').split('-')[0]
+                if year:
+                    years[year] = years.get(year, 0) + 1
+            
+            # Sort categories by frequency
+            sorted_categories = sorted(categories.items(), key=lambda x: x[1], reverse=True)
+            top_categories = [{'category': cat, 'count': count} for cat, count in sorted_categories[:5]]
+            
+            # Sort years chronologically
+            sorted_years = sorted(years.items())
+            publication_timeline = [{'year': year, 'papers': count} for year, count in sorted_years]
+            
+            # Build the author profile
+            profile = {
+                "name": author_name,
+                "paper_count": papers_found,
+                "papers": author_papers,
+                "research_interests": top_categories,
+                "co_authors": list(co_authors)[:10],  # Limit to top 10 co-authors
+                "publication_timeline": publication_timeline
+            }
+            
+            # Store in session for context in future queries
+            session.metadata["current_author"] = author_name
+            session.metadata["author_papers"] = author_papers
+            session.metadata["last_action"] = "author_profile"
+            
+            # Ensure we're storing the session metadata persistently
+            await agent._update_session(session)
+            
+            logger.info(f"[SESSION] Stored author profile in session")
+            
+            return {
+                "type": "author_profile",
+                "author": author_name,
+                "found": True,
+                "profile": profile
+            }
+            
+        except Exception as e:
+            logger.error(f"[TOOL] Error fetching author profile for {author_name}: {str(e)}")
+            logger.error(traceback.format_exc())
+            
+            return {
+                "type": "author_profile",
+                "author": author_name,
+                "found": False,
                 "error": str(e)
             }
     
@@ -427,19 +620,24 @@ class ArxivResearchAgent(AbstractAgent):
                 search_term = entities.get("search_term", query.prompt)
                 logger.info(f"[ROUTING] Search term: '{search_term}'")
                 
-                # Check for author filter
+                # Extract all relevant parameters from entities
                 author = entities.get("author")
-                if author:
-                    logger.info(f"[ROUTING] Using author filter: '{author}'")
-                    result = await Tools.search_papers(
-                        search_term, 
-                        session, 
-                        self, 
-                        author=author
-                    )
-                else:
-                    # Standard search without filters
-                    result = await Tools.search_papers(search_term, session, self)
+                category = entities.get("category")
+                date_range = entities.get("date_range")
+                sort_by = entities.get("sort_by")
+                
+                logger.info(f"[ROUTING] Using parameters - author: '{author}', category: '{category}', date_range: '{date_range}', sort_by: '{sort_by}'")
+                
+                # Call search_papers with all extracted parameters
+                result = await Tools.search_papers(
+                    search_term, 
+                    session, 
+                    self, 
+                    author=author,
+                    category=category,
+                    date_range=date_range,
+                    sort_by=sort_by
+                )
                 
                 await self._handle_search_response(result, response_handler, session)
                 
@@ -453,6 +651,18 @@ class ArxivResearchAgent(AbstractAgent):
                 else:
                     logger.error("[ROUTING] No paper ID found in entities")
                     await self._handle_error_response("Unable to identify a paper ID in the query.", response_handler)
+                
+            elif query_type == QueryType.AUTHOR_PROFILE:
+                logger.info("[ROUTING] Handling as AUTHOR_PROFILE query")
+                # Fix: Check for both 'author' and 'author_name' in entities
+                author_name = entities.get("author") or entities.get("author_name")
+                logger.info(f"[ROUTING] Author name: '{author_name}'")
+                if author_name:
+                    result = await Tools.get_author_profile(author_name, session, self)
+                    await self._handle_author_profile_response(result, response_handler, session)
+                else:
+                    logger.error("[ROUTING] No author name found in entities")
+                    await self._handle_error_response("Unable to identify an author name in the query.", response_handler)
                 
             elif query_type == QueryType.FOLLOWUP:
                 logger.info("[ROUTING] Handling as FOLLOWUP query")
@@ -499,10 +709,39 @@ class ArxivResearchAgent(AbstractAgent):
                 await self._handle_greeting_response(query.prompt, response_handler)
                 
             else:  # QueryType.UNKNOWN
-                logger.info("[ROUTING] Handling as UNKNOWN query (defaulting to search)")
-                # Try to handle as a search query by default
-                result = await Tools.search_papers(query.prompt, session, self)
-                await self._handle_search_response(result, response_handler, session)
+                logger.info("[ROUTING] Handling as UNKNOWN query")
+                # For unknown queries, have the LLM respond directly
+                try:
+                    prompt = f"""
+                    The user has asked something that doesn't clearly fit into a specific query type.
+                    Please provide a helpful response that:
+                    1. Acknowledges their query
+                    2. Explains what types of queries you can help with
+                    3. Gives examples of how they can phrase their request
+                    4. Maintains a professional, academic tone
+                    
+                    User's query: {query.prompt}
+                    """
+                    
+                    system_prompt = (
+                        "You are a helpful research assistant specializing in finding and explaining scientific papers. "
+                        "When you receive unclear queries, you help guide users to better express their research needs."
+                    )
+                    
+                    logger.info("[RESPONSE] Generating response for unknown query")
+                    response = await self._model_provider.query(prompt, system_prompt)
+                    
+                    # Create final response stream
+                    final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+                    await final_response_stream.emit_chunk(response)
+                    await final_response_stream.complete()
+                    
+                except Exception as e:
+                    logger.error(f"[RESPONSE] Error generating response for unknown query: {str(e)}")
+                    await self._handle_error_response(
+                        "I'm not sure how to help with that. You can ask me to search for papers on a topic, get details about a specific paper, or ask for help using this system.",
+                        response_handler
+                    )
                 
             # Make sure to update the session store after handling the query
             await self._update_session(session)
@@ -529,10 +768,16 @@ class ArxivResearchAgent(AbstractAgent):
                 logger.info(f"[SESSION] - current_paper: '{paper.get('title')}' - ID: {paper.get('id')}")
             else:
                 logger.info(f"[SESSION] - {key}: {value}")
+
+                
     
-    async def _classify_query(self, query_text: str, session: Session) -> Tuple[QueryType, Dict[str, Any]]:
+    async def _classify_query(
+            self,
+            query_text: str,
+            session: Session
+    ) -> Tuple[QueryType, Dict[str, Any]]:
         """
-        Enhanced classification of queries to determine intent and extract parameters.
+        Classify the query using LLM first, falling back to pattern matching.
         
         Args:
             query_text: The raw query text
@@ -541,7 +786,170 @@ class ArxivResearchAgent(AbstractAgent):
         Returns:
             A tuple of (QueryType, entities_dict)
         """
-        logger.info(f"[CLASSIFY] Classifying query: '{query_text}'")
+        try:
+            # Try LLM classification first
+            return await self._classify_query_with_llm(query_text, session)
+        except Exception as e:
+            logger.error(f"[CLASSIFY] LLM classification failed, falling back to pattern-based: {str(e)}")
+            return await self._classify_query_pattern_based(query_text, session)
+
+    async def _classify_query_with_llm(self, query_text: str, session: Session) -> Tuple[QueryType, Dict[str, Any]]:
+        """
+        Use the LLM to classify the query and extract relevant entities.
+        
+        Args:
+            query_text: The raw query text
+            session: The session information
+                
+        Returns:
+            A tuple of (QueryType, entities_dict)
+        """
+        logger.info(f"[CLASSIFY] Classifying query with LLM: '{query_text}'")
+        
+        # Build context from session
+        context = "No previous conversation context."
+        if hasattr(session, "metadata"):
+            if "last_action" in session.metadata:
+                context = f"The last action was: {session.metadata['last_action']}"
+                
+                if session.metadata["last_action"] == "search" and "last_papers" in session.metadata:
+                    papers = session.metadata["last_papers"]
+                    paper_titles = [p.get('title', 'Unknown') for p in papers[:3]]
+                    context += f"\nThe last search returned these papers: {', '.join(paper_titles)}"
+                    if "last_query" in session.metadata:
+                        context += f"\nThe search query was: {session.metadata['last_query']}"
+                        
+                elif session.metadata["last_action"] == "paper_detail" and "current_paper" in session.metadata:
+                    paper = session.metadata["current_paper"]
+                    context += f"\nThe current paper being discussed is: {paper.get('title', 'Unknown')}"
+        
+        # Create prompt for classification
+        system_prompt = """You are a query analyzer for an arXiv research assistant. Classify the user's query type and extract entities.
+
+Query types:
+- SEARCH: User wants to search for papers on a topic
+- PAPER_DETAIL: User wants details about a specific paper
+- AUTHOR_PROFILE: User wants information about an author's work and background
+- FOLLOWUP: User is asking a follow-up about previous results
+- AGENT_INFO: User is asking about the agent itself
+- GREETING: A simple greeting
+- UNKNOWN: Cannot classify
+
+Output JSON format:
+{
+  "query_type": "TYPE",
+  "entities": {
+    "search_term": "extracted search term",
+    "paper_id": "extracted paper ID",
+    "author": "extracted author name",
+    "topic": "extracted topic/category",
+    "date_range": "extracted date range",
+    "sort_by": "how to sort (relevance, submittedDate, lastUpdatedDate)",
+    "list_all_papers": true/false
+  }
+}
+
+IMPORTANT RULES:
+1. If the query explicitly asks about an author (e.g., "tell me about author X", "show me papers by X", "who is X") classify as AUTHOR_PROFILE.
+2. If the query mentions a specific paper by ID or title, classify as PAPER_DETAIL.
+3. For AUTHOR_PROFILE, always include the "author" entity with the full author name.
+4. Only include entities that are present in the query.
+5. For SEARCH, include sort_by="submittedDate" if no specific query is present, as users typically want recent papers by default.
+"""
+        
+        prompt = f"""
+        Classify this query from a user talking to an arXiv research assistant:
+        
+        USER QUERY: {query_text}
+        
+        CONVERSATION CONTEXT:
+        {context}
+        
+        Based on the query and context, determine the query type and extract relevant entities.
+        Return ONLY a valid JSON object with "query_type" and "entities" fields.
+        """
+        
+        try:
+            # Call the model for classification
+            response = await self._model_provider.query(prompt, system_prompt)
+            
+            # Clean the response to extract just the JSON part
+            json_start = response.find('{')
+            json_end = response.rfind('}') + 1
+            if json_start >= 0 and json_end > json_start:
+                json_str = response[json_start:json_end]
+            else:
+                json_str = response
+                
+            # Parse the JSON response
+            try:
+                classification = json.loads(json_str)
+                
+                # Get query type
+                query_type_str = classification.get("query_type", "UNKNOWN").upper()
+                try:
+                    query_type = QueryType[query_type_str]
+                except KeyError:
+                    logger.error(f"[CLASSIFY] Invalid query type returned: {query_type_str}")
+                    query_type = QueryType.UNKNOWN
+                    
+                # Get entities
+                entities = classification.get("entities", {})
+                
+                # If we have a paper_title, try to find the matching paper in last_papers
+                if "paper_title" in entities and "last_papers" in session.metadata:
+                    paper_title = entities["paper_title"].lower()
+                    for paper in session.metadata["last_papers"]:
+                        if paper_title in paper.get("title", "").lower():
+                            entities["paper_id"] = self._extract_paper_id(paper)
+                            logger.info(f"[CLASSIFY] Found matching paper for title '{paper_title}': {entities['paper_id']}")
+                            break
+                
+                # Normalize sort_by and date_range values if present
+                if "sort_by" in entities:
+                    sort_value = entities["sort_by"].lower()
+                    if sort_value in ["relevance", "lastupdateddate", "submitteddate"]:
+                        entities["sort_by"] = sort_value
+                    else:
+                        logger.warning(f"[CLASSIFY] Invalid sort_by value: {sort_value}")
+                        del entities["sort_by"]
+                
+                if "date_range" in entities:
+                    date_value = entities["date_range"].lower()
+                    valid_ranges = ["last_day", "last_week", "last_month", "last_year"]
+                    if date_value in valid_ranges or "to" in date_value:
+                        entities["date_range"] = date_value
+                    else:
+                        logger.warning(f"[CLASSIFY] Invalid date_range value: {date_value}")
+                        del entities["date_range"]
+                
+                logger.info(f"[CLASSIFY] LLM classified as: {query_type.value}, Entities: {entities}")
+                return query_type, entities
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"[CLASSIFY] Failed to parse JSON from LLM: {response}")
+                logger.error(f"[CLASSIFY] JSON error: {str(e)}")
+                # Only fall back if we can't parse the JSON at all
+                return await self._classify_query_pattern_based(query_text, session)
+                
+        except Exception as e:
+            logger.error(f"[CLASSIFY] Error in LLM classification: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Only fall back if there's a complete failure
+            return await self._classify_query_pattern_based(query_text, session)
+
+    async def _classify_query_pattern_based(self, query_text: str, session: Session) -> Tuple[QueryType, Dict[str, Any]]:
+        """
+        Pattern-based classification of queries to determine intent and extract parameters.
+        
+        Args:
+            query_text: The raw query text
+            session: The session information
+                
+        Returns:
+            A tuple of (QueryType, entities_dict)
+        """
+        logger.info(f"[CLASSIFY] Using pattern-based classification for query: '{query_text}'")
         
         # Convert to lowercase for easier matching
         text = query_text.lower()
@@ -796,7 +1204,7 @@ class ArxivResearchAgent(AbstractAgent):
             response_handler: ResponseHandler,
             session: Session
     ):
-        """Enhanced handler for search responses that adds context about filters."""
+        """Enhanced handler for search responses that provides an overview of all papers."""
         logger.info("[RESPONSE] Handling search response")
         
         # Extract info from result
@@ -853,46 +1261,50 @@ class ArxivResearchAgent(AbstractAgent):
             final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
             
             try:
-                # Generate a concise, customized response that doesn't sound templated
-                logger.info("[RESPONSE] Generating final response")
+                # Generate a concise, customized response that includes ALL papers
+                logger.info("[RESPONSE] Generating final response with all papers")
                 
-                # Build a prompt that includes filter context
-                prompt_context = f'related to "{query}"' if query else ""
-                if author_filter:
-                    prompt_context = f'by author {author_filter}'
-                    if query:
-                        prompt_context += f' related to "{query}"'
-                
+                # Build a prompt that requests summaries of all papers
                 prompt = f"""
-                Generate a natural, conversational response about the papers I found {prompt_context}.
+                Generate a natural, conversational response about the {count} papers I found related to "{query}".
                 
-                I found {count} papers. The most relevant is "{search_results[0]['title']}" by {', '.join(search_results[0]['authors'][:2])}.
+                Here are the papers:
+                {json.dumps([{
+                    "title": paper.get("title"),
+                    "authors": ", ".join(paper.get("authors", [])[:2]) + (" et al." if len(paper.get("authors", [])) > 2 else ""),
+                    "published": paper.get("published"),
+                    "primary_category": paper.get("primary_category", ""),
+                    "summary_snippet": paper.get("summary", "")[:150] + "..."
+                } for paper in search_results], indent=2)}
                 
                 Make your response:
-                1. Sound natural and conversational, not like a template
-                2. Briefly mention the most interesting finding or contribution of the top paper
-                3. Tell the user they can ask for more details about any paper
-                4. Be concise (3-4 sentences total)
-                5. Use formal academic language (absolutely no profanity or slang)
-                6. Do not begin with "I found X papers related to Y" or any similar template phrases
+                1. Include a brief mention of EACH paper with its title and main topic
+                2. Group papers by theme if possible
+                3. Do NOT focus only on the first/most relevant paper
+                4. Tell the user they can ask for more details about any specific paper
+                5. Be concise but comprehensive
+                6. Use formal academic language (no profanity or slang)
                 
-                EXTREMELY IMPORTANT: DO NOT use informal language, slang or profanity of any kind. Keep your language strictly professional and academic.
+                EXTREMELY IMPORTANT: 
+                - DO NOT use informal language or slang
+                - DO NOT say "I found X papers" - instead, describe the papers themselves
+                - MENTION EACH PAPER by title (in quotes) and briefly what it's about
+                - Include the PAPER NUMBER (1-5) before each title to make it easy for the user to reference
                 """
                 
-                # Custom system prompt for a more varied response with explicit content filtering
+                # Custom system prompt for a comprehensive response
                 system_prompt = (
                     "You are a knowledgeable research assistant who specializes in scientific literature. "
                     "Your responses are helpful, varied, and tailored to each query. "
-                    "You always use professional, academic language without ANY profanity or slang. "
-                    "You sound natural but scholarly and formal. "
-                    "NEVER use inappropriate language, profanity, or casual slang terms. "
-                    "Maintain the highest standards of academic discourse at all times."
+                    "When presenting search results, you briefly describe EACH paper found, "
+                    "not just the most relevant one. "
+                    "You maintain a scholarly tone while being conversational and helpful."
                 )
                 
                 logger.info(f"[RESPONSE] Calling model for final response with prompt of length {len(prompt)}")
                 response = await self._model_provider.query(prompt, system_prompt)
                 
-                # Apply additional content filtering
+                # Apply content filtering
                 filtered_response = self._filter_inappropriate_content(response)
                 
                 logger.info(f"[RESPONSE] Generated final response of length {len(filtered_response)}")
@@ -906,19 +1318,27 @@ class ArxivResearchAgent(AbstractAgent):
                 logger.error(f"[RESPONSE] Error generating final response: {str(e)}")
                 logger.error(traceback.format_exc())
                 
-                # Fallback to a manual response
-                most_relevant = search_results[0]
+                # Fallback response that still covers all papers
+                fallback_response = f"Here are the papers I found related to \"{query}\":\n\n"
                 
-                # Build fallback response that includes filter context
-                fallback_response = f"My search"
-                if author_filter:
-                    fallback_response += f" for papers by {author_filter}"
-                if query:
-                    fallback_response += f' on "{query}"'
+                for i, paper in enumerate(search_results):
+                    fallback_response += f"{i+1}. \"{paper.get('title')}\" by {', '.join(paper.get('authors', [])[:2])}"
+                    if len(paper.get('authors', [])) > 2:
+                        fallback_response += " et al."
+                    fallback_response += f" ({paper.get('published')})\n"
+                    fallback_response += f"   Category: {paper.get('primary_category', 'N/A')}\n"
                     
-                fallback_response += f" found {count} relevant papers. The most notable is \"{most_relevant['title']}\" by {', '.join(most_relevant['authors'][:2])}, which explores {most_relevant['summary'][:100]}...\n\nWould you like more details about this paper?"
+                    # Add a brief snippet of the summary
+                    summary = paper.get('summary', '')
+                    if summary:
+                        summary_snippet = summary[:150] + "..." if len(summary) > 150 else summary
+                        fallback_response += f"   Summary: {summary_snippet}\n"
+                    
+                    fallback_response += "\n"
                 
-                logger.info("[RESPONSE] Using fallback response")
+                fallback_response += "You can ask for more details about any of these papers by referring to its number or title."
+                
+                logger.info("[RESPONSE] Using fallback response with all papers")
                 await final_response_stream.emit_chunk(fallback_response)
                 
             await final_response_stream.complete()
@@ -1532,7 +1952,7 @@ class ArxivResearchAgent(AbstractAgent):
             papers: List[Dict[str, Any]],
             author: str = None
     ) -> AsyncIterator[str]:
-        """Generate a summary of search results with enhanced context."""
+        """Generate a comprehensive summary of all search results."""
         context = f"search query: \"{query}\"" if query else "search"
         if author:
             context = f"search for papers by author \"{author}\""
@@ -1557,17 +1977,24 @@ class ArxivResearchAgent(AbstractAgent):
         {papers_text}
         
         Please provide:
-        1. A formal academic overview of these research papers (2-3 sentences per paper)
+        1. A brief overview of EACH paper found (1-2 sentences per paper)
         2. How they relate to the {context} (1-2 sentences)
-        3. Which papers might be most relevant and why (2-3 sentences)
+        3. Any thematic connections between the papers (1-2 sentences)
         
-        Use professional academic language throughout. ABSOLUTELY DO NOT use informal language, slang, or profanity.
+        IMPORTANT: 
+        - Cover ALL papers, not just the most relevant ones
+        - Number each paper discussion (1-5)
+        - Provide equal attention to each paper
+        - Group papers by theme if possible
+        - Use formal academic language throughout
+        - DO NOT use informal language, slang, or profanity
         """
         
         # Custom system prompt for search summary with enhanced content filtering
         system_prompt = (
             "You are a professional academic research assistant specializing in scientific literature. "
             "You help researchers understand available papers on topics using formal, scholarly language. "
+            "You provide comprehensive coverage of ALL papers found, not just the most relevant ones. "
             "NEVER use casual expressions, slang, or profanity in your analyses. Maintain a professional, "
             "objective tone suitable for publication in an academic journal. "
             "Under no circumstances should you use ANY inappropriate language."
@@ -1596,7 +2023,7 @@ class ArxivResearchAgent(AbstractAgent):
                     logger.warning(f"[SUMMARY] API error in search summary: {str(e)}. Retrying in {delay:.2f}s ({retry_count}/{max_retries})")
                     await asyncio.sleep(delay)
         except Exception as e:
-            # Provide a simpler fallback response
+            # Provide a simpler fallback response that still covers all papers
             logger.error(f"[SUMMARY] Error generating search summary: {str(e)}")
             logger.error(traceback.format_exc())
             
@@ -1608,14 +2035,261 @@ class ArxivResearchAgent(AbstractAgent):
             simple_summary = f"Based on your search{author_context}{query_context}, I found {len(papers)} relevant papers:\n\n"
             yield simple_summary
             
-            for i, paper in enumerate(papers[:3]):
-                paper_summary = f"Paper {i+1}: \"{paper['title']}\" by {', '.join(paper['authors'][:2])}\n"
-                paper_summary += f"Published: {paper['published']}\n"
-                paper_summary += f"Summary: {paper['summary'][:150]}...\n\n"
+            for i, paper in enumerate(papers):
+                paper_summary = f"{i+1}. \"{paper['title']}\" by {', '.join(paper['authors'][:2])}\n"
+                paper_summary += f"   Published: {paper['published']}\n"
+                paper_summary += f"   Categories: {', '.join(paper['categories'])}\n"
+                paper_summary += f"   Summary: {paper['summary'][:150]}...\n\n"
                 yield paper_summary
             
             yield "You can ask for more details about any of these papers."
             logger.info("[SUMMARY] Fallback summary generation complete")
+
+    async def _handle_author_profile_response(
+            self,
+            result: Dict[str, Any],
+            response_handler: ResponseHandler,
+            session: Session
+    ):
+        """Handle the response for an author profile query."""
+        logger.info("[RESPONSE] Handling author profile response")
+        
+        author_name = result["author"]
+        found = result["found"]
+        
+        # Notify user about fetching the author profile
+        await response_handler.emit_text_block(
+            "FETCH_AUTHOR", f"Fetching profile for author {author_name}..."
+        )
+        
+        if found:
+            profile = result["profile"]
+            logger.info(f"[RESPONSE] Author profile found for: '{author_name}'")
+            
+            # Emit author profile as JSON
+            await response_handler.emit_json(
+                "AUTHOR_PROFILE", {"profile": profile}
+            )
+            
+            try:
+                # Generate and stream author profile summary
+                logger.info("[RESPONSE] Generating author profile summary")
+                summary_stream = response_handler.create_text_stream("AUTHOR_SUMMARY")
+                async for chunk in self._generate_author_summary(profile):
+                    filtered_chunk = self._filter_inappropriate_content(chunk)
+                    await summary_stream.emit_chunk(filtered_chunk)
+                await summary_stream.complete()
+                logger.info("[RESPONSE] Author profile summary generation complete")
+            except Exception as e:
+                logger.error(f"[RESPONSE] Error generating author summary: {str(e)}")
+                logger.error(traceback.format_exc())
+            
+            # Create final response
+            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+            
+            try:
+                # Generate a detailed, conversational profile
+                prompt = f"""
+                Create a detailed profile summary for author {author_name} based on their publications.
+                
+                Author information:
+                - Name: {author_name}
+                - Total publications found: {profile['paper_count']}
+                - Top research areas: {', '.join([item['category'] for item in profile['research_interests'][:3]])}
+                - Publication timeline: {json.dumps(profile['publication_timeline'])}
+                - Recent co-authors: {', '.join(profile['co_authors'][:5])}
+                
+                Recent papers (up to 5):
+                {json.dumps([{
+                    "title": paper.get("title"),
+                    "published": paper.get("published"),
+                    "categories": paper.get("categories", []),
+                    "summary": paper.get("summary", "")[:150] + "..."
+                } for paper in profile['papers'][:5]], indent=2)}
+                
+                Make your response:
+                1. Start with a brief professional introduction of the author based on their research focus
+                2. Describe their research interests and how they've evolved over time (if visible in the timeline)
+                3. Mention their publication activity and recent work
+                4. Highlight 2-3 of their most recent or significant papers with brief descriptions
+                5. Mention key collaborators if notable patterns exist
+                6. Conclude with a summary of their contribution to their field
+                7. End by asking if the user would like to explore any specific paper
+                
+                Use formal academic language, be objective and thorough.
+                """
+                
+                system_prompt = (
+                    "You are a professional academic research assistant specializing in author profiles. "
+                    "Your summaries provide comprehensive, objective overviews of researchers based on "
+                    "their publication history. You identify patterns in their work and highlight their "
+                    "key contributions to their field. Your tone is formal, scholarly, and precise."
+                )
+                
+                logger.info(f"[RESPONSE] Calling model for author profile with prompt of length {len(prompt)}")
+                response = await self._model_provider.query(prompt, system_prompt)
+                
+                # Apply content filtering
+                filtered_response = self._filter_inappropriate_content(response)
+                
+                logger.info(f"[RESPONSE] Generated author profile of length {len(filtered_response)}")
+                
+                await final_response_stream.emit_chunk(filtered_response)
+            except Exception as e:
+                logger.error(f"[RESPONSE] Error generating author profile: {str(e)}")
+                logger.error(traceback.format_exc())
+                
+                # Fallback response
+                fallback_response = f"## Author Profile: {author_name}\n\n"
+                
+                # Research interests
+                fallback_response += "### Research Interests\n"
+                for interest in profile['research_interests'][:5]:
+                    fallback_response += f"- {interest['category']} ({interest['count']} papers)\n"
+                
+                # Publication history
+                fallback_response += "\n### Publication History\n"
+                for year_data in profile['publication_timeline']:
+                    fallback_response += f"- {year_data['year']}: {year_data['papers']} publications\n"
+                
+                # Recent papers
+                fallback_response += "\n### Recent Publications\n"
+                for i, paper in enumerate(profile['papers'][:5]):
+                    fallback_response += f"{i+1}. \"{paper.get('title')}\" ({paper.get('published')})\n"
+                    fallback_response += f"   Categories: {', '.join(paper.get('categories', ['N/A']))}\n\n"
+                
+                # Co-authors
+                fallback_response += "\n### Key Collaborators\n"
+                for coauthor in profile['co_authors'][:5]:
+                    fallback_response += f"- {coauthor}\n"
+                
+                fallback_response += "\nYou can ask for more details about any of these papers or request additional information about this author's work."
+                
+                logger.info("[RESPONSE] Using fallback author profile")
+                await final_response_stream.emit_chunk(fallback_response)
+                
+            await final_response_stream.complete()
+        else:
+            # Author not found
+            error = result.get("error", "Unknown error")
+            logger.error(f"[RESPONSE] Author not found: {error}")
+            
+            await response_handler.emit_text_block(
+                "ERROR", f"Could not find information for author: {error}"
+            )
+            
+            # Create a more helpful error response
+            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+            
+            await final_response_stream.emit_chunk(
+                f"I couldn't find detailed information for author '{author_name}'. This might be due to:"
+                f"\n\n- Variant spellings of the author's name"
+                f"\n- The author using a different name format in publications"
+                f"\n- Limited publication history on arXiv"
+                f"\n\nTry searching for papers by this author with a more general query like 'search for papers by {author_name}'."
+            )
+            
+            await final_response_stream.complete()
+        
+        # Mark response as complete
+        await response_handler.complete()
+        logger.info("[RESPONSE] Author profile response handling complete")
+
+    async def _generate_author_summary(
+            self,
+            profile: Dict[str, Any]
+    ) -> AsyncIterator[str]:
+        """Generate a comprehensive summary of an author's research profile."""
+        
+        author_name = profile["name"]
+        paper_count = profile["paper_count"]
+        research_interests = profile["research_interests"]
+        papers = profile["papers"]
+        timeline = profile["publication_timeline"]
+        
+        logger.info(f"[SUMMARY] Generating author summary for {author_name}")
+        
+        # Extract research interest categories
+        top_categories = [item['category'] for item in research_interests[:5]]
+        
+        # Format recent papers for the summary
+        recent_papers_text = "\n\n".join([
+            f"Paper {i+1}:\n"
+            f"Title: {paper['title']}\n"
+            f"Published: {paper['published']}\n"
+            f"Categories: {', '.join(paper['categories'])}\n"
+            f"Summary: {paper['summary'][:200]}..."
+            for i, paper in enumerate(papers[:5])
+        ])
+        
+        # Create publication timeline summary
+        timeline_str = ", ".join([f"{item['year']}: {item['papers']} papers" for item in timeline])
+        
+        prompt = f"""
+        Generate a comprehensive academic profile for author {author_name}.
+        
+        Profile data:
+        - Total publications found: {paper_count}
+        - Research areas: {', '.join(top_categories)}
+        - Publication timeline: {timeline_str}
+        
+        Recent papers:
+        {recent_papers_text}
+        
+        Please provide:
+        1. An overview of the author's research focus and expertise
+        2. Analysis of their research trajectory and evolution over time
+        3. Description of their publication impact and contributions to the field
+        4. Brief summary of their most recent or significant work
+        
+        Use formal academic language appropriate for researchers.
+        """
+        
+        system_prompt = (
+            "You are a professional academic research assistant specializing in researcher profiles. "
+            "You analyze publication patterns to create insightful, objective summaries of "
+            "researchers' work and contributions. Your summaries highlight research focus, "
+            "methodological approaches, and key contributions. You maintain scholarly "
+            "objectivity while providing valuable context about the researcher's significance."
+        )
+        
+        logger.info(f"[SUMMARY] Sending prompt of length {len(prompt)} to model")
+        
+        try:
+            async for chunk in self._model_provider.query_stream(prompt, system_prompt):
+                filtered_chunk = self._filter_inappropriate_content(chunk)
+                yield filtered_chunk
+            logger.info("[SUMMARY] Successfully completed author summary generation")
+        except Exception as e:
+            # Fallback for error cases
+            logger.error(f"[SUMMARY] Error generating author summary: {str(e)}")
+            logger.error(traceback.format_exc())
+            
+            # Provide a simpler fallback response
+            yield f"## Author Profile: {author_name}\n\n"
+            
+            # Research focus
+            yield f"{author_name} has published {paper_count} papers on arXiv"
+            if top_categories:
+                yield f", primarily in the areas of {', '.join(top_categories[:3])}.\n\n"
+            else:
+                yield ".\n\n"
+            
+            # Recent papers
+            yield "### Recent Publications:\n\n"
+            
+            for i, paper in enumerate(papers[:3]):
+                title = paper.get('title', 'Untitled')
+                published = paper.get('published', 'Unknown date')
+                
+                yield f"**{i+1}. {title}** ({published})\n\n"
+                
+                summary = paper.get('summary', '')
+                if summary:
+                    short_summary = summary[:200] + "..." if len(summary) > 200 else summary
+                    yield f"{short_summary}\n\n"
+            
+            yield "You can request more details about any of these papers or explore other aspects of this author's work."
 
 
 # Modified DefaultServer implementation that properly manages sessions
