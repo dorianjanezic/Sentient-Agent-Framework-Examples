@@ -1,0 +1,5 @@
+sentient-agent-framework
+openai
+python-dotenv
+arxiv
+numpy
