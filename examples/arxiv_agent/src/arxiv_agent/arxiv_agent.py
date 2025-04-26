@@ -58,18 +58,88 @@ INAPPROPRIATE_WORDS = [
 # Define tools that the agent can use
 class Tools:
     @staticmethod
-    async def search_papers(query: str, session: Session, agent: 'ArxivResearchAgent') -> Dict[str, Any]:
-        """Search for papers on arXiv."""
-        logger.info(f"[TOOL] search_papers called with query: '{query}'")
+    async def search_papers(
+        query: str, 
+        session: Session, 
+        agent: 'ArxivResearchAgent',
+        author: str = None,
+        topic: str = None,
+        date_range: str = None,
+        sort_by: str = "relevance"
+    ) -> Dict[str, Any]:
+        """
+        Enhanced search for papers on arXiv with additional filters.
+        
+        Args:
+            query: The basic search query text
+            session: Session information
+            agent: The ArxivResearchAgent instance
+            author: Optional author name to filter results
+            topic: Optional topic/category to filter results
+            date_range: Optional date range for filtering (e.g., "last_month")
+            sort_by: How to sort results (relevance, date, etc.)
+            
+        Returns:
+            Dictionary with search results
+        """
+        logger.info(f"[TOOL] search_papers called with query: '{query}', author: '{author}', topic: '{topic}'")
         
         # Ensure session metadata exists
         if not hasattr(session, "metadata") or session.metadata is None:
             session.metadata = {'client_id': 'default_user'}
             logger.info("[SESSION] Initialized empty session metadata")
         
+        # Build search query with filters
+        search_query = query.strip()
+        search_params = []
+        
+        # Store the original user query for context
+        original_query = query
+        
+        # Add author filter if provided
+        if author:
+            # Format author name for arXiv search
+            formatted_author = f'au:"{author}"'
+            search_params.append(formatted_author)
+            logger.info(f"[TOOL] Added author filter: {formatted_author}")
+        
+        # Add topic/category filter if provided
+        if topic:
+            # Format topic for arXiv search
+            formatted_topic = f'cat:{topic}'
+            search_params.append(formatted_topic)
+            logger.info(f"[TOOL] Added topic filter: {formatted_topic}")
+        
+        # Add date range filter if provided
+        if date_range:
+            # Convert friendly date range to arXiv format
+            # This is a simplification - actual implementation would need more logic
+            if date_range == "last_month":
+                # Logic to calculate date from last month
+                search_params.append("submittedDate:[NOW-1MONTH TO NOW]")
+                logger.info(f"[TOOL] Added date range filter: {date_range}")
+        
+        # Combine all search parameters
+        if search_params:
+            if search_query:
+                # Combine with AND if there's already a query
+                combined_query = f"{' AND '.join(search_params)} AND ({search_query})"
+            else:
+                # Just use the parameters if no query text
+                combined_query = f"{' AND '.join(search_params)}"
+            
+            logger.info(f"[TOOL] Built combined query: {combined_query}")
+        else:
+            # Use the original query if no filters
+            combined_query = search_query
+        
         # Perform search
         try:
-            search_results = await agent._arxiv_provider.search(query, max_results=5)
+            # Removed the sort_by parameter since ArxivProvider.search() doesn't accept it
+            search_results = await agent._arxiv_provider.search(
+                combined_query, 
+                max_results=5
+            )
             logger.info(f"[TOOL] search_papers found {len(search_results)} results")
             
             # Log paper titles and IDs for debugging
@@ -79,8 +149,17 @@ class Tools:
             # Store in session for context in future queries
             if search_results:
                 session.metadata["last_papers"] = search_results
-                session.metadata["last_query"] = query
+                session.metadata["last_query"] = original_query  # Store original query
                 session.metadata["last_action"] = "search"
+                
+                # Store search parameters for context
+                session.metadata["search_params"] = {
+                    "query": query,
+                    "author": author,
+                    "topic": topic,
+                    "date_range": date_range,
+                    "sort_by": sort_by
+                }
                 
                 # Ensure we're storing the session metadata persistently
                 await agent._update_session(session)
@@ -89,7 +168,12 @@ class Tools:
                 
                 return {
                     "type": "search_results",
-                    "query": query,
+                    "query": original_query,
+                    "filters": {
+                        "author": author,
+                        "topic": topic,
+                        "date_range": date_range
+                    },
                     "count": len(search_results),
                     "results": search_results
                 }
@@ -97,7 +181,12 @@ class Tools:
                 logger.info("[TOOL] No search results found")
                 return {
                     "type": "search_results",
-                    "query": query,
+                    "query": original_query,
+                    "filters": {
+                        "author": author,
+                        "topic": topic,
+                        "date_range": date_range
+                    },
                     "count": 0,
                     "results": []
                 }
@@ -106,7 +195,12 @@ class Tools:
             logger.error(traceback.format_exc())
             return {
                 "type": "search_results",
-                "query": query,
+                "query": original_query,
+                "filters": {
+                    "author": author,
+                    "topic": topic,
+                    "date_range": date_range
+                },
                 "count": 0,
                 "results": [],
                 "error": str(e)
@@ -124,6 +218,8 @@ class Tools:
         
         # Get paper details
         try:
+            # Extract a more specific part of paper_id to avoid errors
+            # (This function is now improved to handle more ID formats)
             paper = await agent._arxiv_provider.get_paper_by_id(paper_id)
             logger.info(f"[TOOL] Successfully retrieved paper: '{paper.get('title')}'")
             
@@ -145,6 +241,24 @@ class Tools:
         except Exception as e:
             logger.error(f"[TOOL] Error fetching paper {paper_id}: {str(e)}")
             logger.error(traceback.format_exc())
+            
+            # Try to recover - if we have the paper in last_papers, use that instead
+            if hasattr(session, "metadata") and "last_papers" in session.metadata:
+                for paper in session.metadata["last_papers"]:
+                    if paper_id in paper.get('id', ''):
+                        logger.info(f"[TOOL] Recovered paper from session: '{paper.get('title')}'")
+                        
+                        session.metadata["current_paper"] = paper
+                        session.metadata["last_action"] = "paper_detail"
+                        await agent._update_session(session)
+                        
+                        return {
+                            "type": "paper_detail",
+                            "paper_id": paper_id,
+                            "found": True,
+                            "paper": paper
+                        }
+            
             return {
                 "type": "paper_detail",
                 "paper_id": paper_id,
@@ -167,55 +281,11 @@ class Tools:
             "capabilities": [
                 "Search for papers on arXiv by topic",
                 "Retrieve details about specific papers by ID",
+                "Find papers by specific authors",
                 "Generate summaries of research findings",
                 "Provide academic context for search results"
             ]
         }
-
-
-class ImprovedDefaultServer(DefaultServer):
-    """An improved version of DefaultServer that maintains client sessions."""
-    
-    def __init__(self, agent: AbstractAgent):
-        super().__init__(agent)
-        self.client_sessions = {}
-        logger.info("[SERVER] Initialized improved server with persistent client sessions")
-    
-    async def handle_request(self, request):
-        """Handle incoming requests with proper session tracking."""
-        
-        # Extract client identifier - could be from headers, cookies, etc.
-        client_id = request.headers.get('X-Client-ID')
-        if not client_id:
-            # Fall back to IP address if no client ID header
-            client_id = f"ip_{request.client.host}"
-        
-        # Get or create client session
-        if client_id in self.client_sessions:
-            session = self.client_sessions[client_id]
-            logger.info(f"[SERVER] Retrieved existing session for client {client_id}")
-        else:
-            session = Session()
-            session.metadata = {'client_id': client_id}
-            self.client_sessions[client_id] = session
-            logger.info(f"[SERVER] Created new session for client {client_id}")
-        
-        # Set client ID in request context
-        request_context = {'client_id': client_id, 'client_ip': request.client.host}
-        
-        # Process the request using the agent
-        query = Query(prompt=request.json()['prompt'], context=request_context)
-        
-        # Create response handler
-        response_handler = ResponseHandler()
-        
-        # Call agent's assist method
-        await self.agent.assist(session, query, response_handler)
-        
-        # Store updated session
-        self.client_sessions[client_id] = session
-        
-        return response_handler.get_response()
 
 
 class ArxivResearchAgent(AbstractAgent):
@@ -262,10 +332,10 @@ class ArxivResearchAgent(AbstractAgent):
             logger.warning("[SESSION] Cannot update session: no metadata found")
             return
             
-        # Get client ID from session metadata
-        client_id = session.metadata.get('client_id', 'default_user')
+        # ALWAYS use the single default user ID for simple testing
+        client_id = "default_user"
         
-        # Store session metadata using client ID
+        # Store session metadata using the fixed client ID
         self._session_store[client_id] = session.metadata
         logger.info(f"[SESSION] Updated persistent session store for client {client_id}")
 
@@ -322,37 +392,10 @@ class ArxivResearchAgent(AbstractAgent):
         logger.info(f"[ASSIST] Received query: '{query.prompt}'")
         
         try:
-            # Extract client identifier from the request
-            # Look for a client ID in various places
-            client_id = None
-            
-            # Try to get from query.context
-            context = getattr(query, 'context', {})
-            client_id = context.get('client_id')
-            
-            # Try to get from request headers if available
-            headers = context.get('request_headers', {})
-            if not client_id and headers:
-                client_id = headers.get('X-Client-ID')
-            
-            # If not found, try query.metadata
-            if not client_id and hasattr(query, 'metadata'):
-                client_id = query.metadata.get('client_id')
-            
-            # If not found, try from session metadata
-            if not client_id and hasattr(session, 'metadata') and session.metadata:
-                client_id = session.metadata.get('client_id')
-            
-            # If still not found, try to get from the HTTP request IP address if available
-            if not client_id and 'client_ip' in context:
-                client_id = f"ip_{context.get('client_ip')}"
-            
-            # If still no client ID, use a consistent value for this session
-            if not client_id:
-                # Generate a unique session ID
-                client_id = f"session_{uuid.uuid4()}"
-            
-            logger.info(f"[SESSION] Using client ID: {client_id}")
+            # IMPORTANT: Always use a single fixed client ID for all requests
+            # This ensures all requests share the same conversation context
+            client_id = "default_user"
+            logger.info(f"[SESSION] Using fixed client ID: {client_id}")
             
             # Initialize session metadata if needed
             if not hasattr(session, 'metadata') or session.metadata is None:
@@ -363,11 +406,10 @@ class ArxivResearchAgent(AbstractAgent):
             
             # Retrieve session data from global store if it exists
             if client_id in self._session_store:
-                # Merge session data to preserve client_id
+                # Copy session data to preserve client_id
                 stored_metadata = self._session_store[client_id]
                 for key, value in stored_metadata.items():
-                    if key != 'client_id':  # Preserve our new client_id
-                        session.metadata[key] = value
+                    session.metadata[key] = value
                 logger.info(f"[SESSION] Retrieved session data for client {client_id}")
             else:
                 logger.info(f"[SESSION] No existing session data for client {client_id}")
@@ -384,7 +426,21 @@ class ArxivResearchAgent(AbstractAgent):
                 logger.info("[ROUTING] Handling as SEARCH query")
                 search_term = entities.get("search_term", query.prompt)
                 logger.info(f"[ROUTING] Search term: '{search_term}'")
-                result = await Tools.search_papers(search_term, session, self)
+                
+                # Check for author filter
+                author = entities.get("author")
+                if author:
+                    logger.info(f"[ROUTING] Using author filter: '{author}'")
+                    result = await Tools.search_papers(
+                        search_term, 
+                        session, 
+                        self, 
+                        author=author
+                    )
+                else:
+                    # Standard search without filters
+                    result = await Tools.search_papers(search_term, session, self)
+                
                 await self._handle_search_response(result, response_handler, session)
                 
             elif query_type == QueryType.PAPER_DETAIL:
@@ -400,33 +456,38 @@ class ArxivResearchAgent(AbstractAgent):
                 
             elif query_type == QueryType.FOLLOWUP:
                 logger.info("[ROUTING] Handling as FOLLOWUP query")
-                # Determine what the follow-up is about based on previous action
-                last_action = session.metadata.get("last_action")
-                logger.info(f"[ROUTING] Last action: '{last_action}'")
-                
-                if last_action == "search" and "last_papers" in session.metadata and len(session.metadata["last_papers"]) > 0:
-                    # Follow-up about the most relevant paper from previous search
-                    most_relevant_paper = session.metadata["last_papers"][0]
-                    logger.info(f"[ROUTING] Most relevant paper: '{most_relevant_paper.get('title')}'")
-                    
-                    paper_id = self._extract_paper_id(most_relevant_paper)
-                    logger.info(f"[ROUTING] Extracted paper ID: '{paper_id}'")
-                    
-                    if paper_id:
-                        result = await Tools.get_paper_details(paper_id, session, self)
-                        await self._handle_paper_detail_response(result, response_handler, session, is_followup=True)
-                    else:
-                        logger.error("[ROUTING] Failed to extract paper ID from most relevant paper")
-                        await self._handle_error_response("Sorry, I couldn't find the paper details from our previous conversation.", response_handler)
-                elif last_action == "paper_detail" and "current_paper" in session.metadata:
-                    # Follow-up about the current paper
-                    logger.info("[ROUTING] Following up on current paper")
-                    paper = session.metadata["current_paper"]
-                    await self._handle_paper_followup_response(paper, query.prompt, response_handler, session)
+                # Handle list all papers request
+                if "list_all_papers" in entities and entities["list_all_papers"]:
+                    logger.info("[ROUTING] Handling as LIST ALL PAPERS request")
+                    await self._handle_list_all_papers_response(session, response_handler)
                 else:
-                    logger.error(f"[ROUTING] Cannot determine follow-up context. Last action: '{last_action}', Has last_papers: {('last_papers' in session.metadata)}")
-                    # Can't determine what the follow-up is about
-                    await self._handle_error_response("I'm not sure what you're asking about. Could you provide more details?", response_handler)
+                    # Determine what the follow-up is about based on previous action
+                    last_action = session.metadata.get("last_action")
+                    logger.info(f"[ROUTING] Last action: '{last_action}'")
+                    
+                    if last_action == "search" and "last_papers" in session.metadata and len(session.metadata["last_papers"]) > 0:
+                        # Follow-up about the most relevant paper from previous search
+                        most_relevant_paper = session.metadata["last_papers"][0]
+                        logger.info(f"[ROUTING] Most relevant paper: '{most_relevant_paper.get('title')}'")
+                        
+                        paper_id = self._extract_paper_id(most_relevant_paper)
+                        logger.info(f"[ROUTING] Extracted paper ID: '{paper_id}'")
+                        
+                        if paper_id:
+                            result = await Tools.get_paper_details(paper_id, session, self)
+                            await self._handle_paper_detail_response(result, response_handler, session, is_followup=True)
+                        else:
+                            logger.error("[ROUTING] Failed to extract paper ID from most relevant paper")
+                            await self._handle_error_response("Sorry, I couldn't find the paper details from our previous conversation.", response_handler)
+                    elif last_action == "paper_detail" and "current_paper" in session.metadata:
+                        # Follow-up about the current paper
+                        logger.info("[ROUTING] Following up on current paper")
+                        paper = session.metadata["current_paper"]
+                        await self._handle_paper_followup_response(paper, query.prompt, response_handler, session)
+                    else:
+                        logger.error(f"[ROUTING] Cannot determine follow-up context. Last action: '{last_action}', Has last_papers: {('last_papers' in session.metadata)}")
+                        # Can't determine what the follow-up is about
+                        await self._handle_error_response("I'm not sure what you're asking about. Could you provide more details?", response_handler)
             
             elif query_type == QueryType.AGENT_INFO:
                 logger.info("[ROUTING] Handling as AGENT_INFO query")
@@ -471,12 +532,12 @@ class ArxivResearchAgent(AbstractAgent):
     
     async def _classify_query(self, query_text: str, session: Session) -> Tuple[QueryType, Dict[str, Any]]:
         """
-        Classify the query to determine its type and extract relevant entities.
+        Enhanced classification of queries to determine intent and extract parameters.
         
         Args:
             query_text: The raw query text
             session: The session information
-            
+                
         Returns:
             A tuple of (QueryType, entities_dict)
         """
@@ -488,9 +549,10 @@ class ArxivResearchAgent(AbstractAgent):
         
         # Check for greetings
         greeting_patterns = ["hello", "hi ", "hey", "greetings", "what's up"]
-        if any(pattern in text.split() or text.startswith(pattern) for pattern in greeting_patterns):
-            logger.info("[CLASSIFY] Matched greeting pattern")
-            return QueryType.GREETING, {}
+        for pattern in greeting_patterns:
+            if text.startswith(pattern) or pattern.strip() == text:
+                logger.info("[CLASSIFY] Matched greeting pattern")
+                return QueryType.GREETING, {}
         
         # Check for agent info queries
         agent_info_patterns = ["who are you", "what can you do", "what are you", "help", "your capabilities"]
@@ -503,6 +565,20 @@ class ArxivResearchAgent(AbstractAgent):
         last_action = session.metadata.get("last_action") if has_last_action else None
         
         logger.info(f"[CLASSIFY] Follow-up check - Has last_action: {has_last_action}, Last action: '{last_action}'")
+        
+        # Check for "list all papers" type queries - These should be treated as follow-ups
+        # when we have previous search results
+        list_papers_patterns = [
+            "list all papers", "show all papers", "what papers did you find", 
+            "what other papers", "show me all papers", "what else did you find",
+            "list the papers", "show papers", "all papers", "the other papers"
+        ]
+        
+        if has_last_action and last_action == "search" and "last_papers" in session.metadata:
+            if any(pattern in text for pattern in list_papers_patterns):
+                matched_pattern = next((p for p in list_papers_patterns if p in text), None)
+                logger.info(f"[CLASSIFY] Matched list papers pattern: '{matched_pattern}'")
+                return QueryType.FOLLOWUP, {"list_all_papers": True}
         
         # Enhanced check for follow-up queries
         # - Expanded patterns to catch more variations
@@ -520,6 +596,27 @@ class ArxivResearchAgent(AbstractAgent):
             "this paper", "the paper", "that paper", "the first paper", 
             "the top paper", "the most relevant paper"
         ]
+        
+        # Author search patterns - NEW
+        author_search_patterns = [
+            "papers by this author", "more papers by this author", 
+            "other papers by this author", "find papers by this author",
+            "author's other papers", "more from this author", 
+            "what else has this author written", "other research by this author",
+            "same author", "other works by"
+        ]
+        
+        # Check for author search patterns if we have a current paper
+        if has_last_action and "current_paper" in session.metadata:
+            current_paper = session.metadata["current_paper"]
+            if any(pattern in text for pattern in author_search_patterns):
+                # Extract author from current paper
+                if "authors" in current_paper and current_paper["authors"]:
+                    author = current_paper["authors"][0]  # First author
+                    entities["author"] = author
+                    entities["search_term"] = ""  # Empty search term, just use author filter
+                    logger.info(f"[CLASSIFY] Detected author search for: '{author}'")
+                    return QueryType.SEARCH, entities
         
         # First, check for explicit paper references if we have session context
         if has_last_action:
@@ -543,26 +640,58 @@ class ArxivResearchAgent(AbstractAgent):
         # Check for arXiv ID patterns
         arxiv_id_pattern = r'(\d{4}\.\d{5})(v\d+)?'
         arxiv_url_pattern = r'arxiv\.org\/abs\/(\d{4}\.\d{5})(v\d+)?'
+        old_arxiv_pattern = r'(\w+)\/(\d{7})(v\d+)?'  # e.g., physics/0609047
         
         arxiv_id_match = re.search(arxiv_id_pattern, query_text)
         arxiv_url_match = re.search(arxiv_url_pattern, query_text)
+        old_arxiv_match = re.search(old_arxiv_pattern, query_text)
         
-        if arxiv_id_match or arxiv_url_match:
-            paper_id = arxiv_id_match.group(1) if arxiv_id_match else arxiv_url_match.group(1)
+        if arxiv_id_match:
+            paper_id = arxiv_id_match.group(1)
             entities["paper_id"] = paper_id
             logger.info(f"[CLASSIFY] Matched paper ID pattern: '{paper_id}'")
             return QueryType.PAPER_DETAIL, entities
+        elif arxiv_url_match:
+            paper_id = arxiv_url_match.group(1)
+            entities["paper_id"] = paper_id
+            logger.info(f"[CLASSIFY] Matched paper URL pattern: '{paper_id}'")
+            return QueryType.PAPER_DETAIL, entities
+        elif old_arxiv_match:
+            category = old_arxiv_match.group(1)
+            id_num = old_arxiv_match.group(2)
+            paper_id = f"{category}/{id_num}"
+            entities["paper_id"] = paper_id
+            logger.info(f"[CLASSIFY] Matched old-style paper ID pattern: '{paper_id}'")
+            return QueryType.PAPER_DETAIL, entities
         
-        # Check for paper author patterns
-        author_patterns = ["who is the author", "who wrote", "who are the authors", "authors of", "written by"]
+        # Check for explicit author search patterns
+        author_patterns = ["papers by author", "author search", "find author", "search author"]
+        
+        for pattern in author_patterns:
+            if pattern in text:
+                # Extract author name after the pattern
+                parts = text.split(pattern, 1)
+                if len(parts) > 1 and parts[1].strip():
+                    author_name = parts[1].strip()
+                    # Clean up author name - remove leading "by" if present
+                    if author_name.startswith("by "):
+                        author_name = author_name[3:].strip()
+                    
+                    entities["author"] = author_name
+                    entities["search_term"] = ""  # Empty search term, just use author filter
+                    logger.info(f"[CLASSIFY] Explicit author search for: '{author_name}'")
+                    return QueryType.SEARCH, entities
+        
+        # Check for paper author patterns (questions about authors)
+        author_question_patterns = ["who is the author", "who wrote", "who are the authors", "authors of", "written by"]
         paper_indicators = ["paper", "article", "publication", "research"]
         
-        if any(ap in text for ap in author_patterns) and any(pi in text for pi in paper_indicators):
+        if any(ap in text for ap in author_question_patterns) and any(pi in text for pi in paper_indicators):
             # This is an author question about a paper
             logger.info("[CLASSIFY] Matched author query pattern")
             
             # Extract the paper name/topic
-            for ap in author_patterns:
+            for ap in author_question_patterns:
                 if ap in text:
                     rest = text.split(ap, 1)[1].strip()
                     for pi in paper_indicators:
@@ -618,18 +747,46 @@ class ArxivResearchAgent(AbstractAgent):
         paper_id_full = paper["id"]
         logger.info(f"[EXTRACT] Raw paper ID: '{paper_id_full}'")
         
-        # Handle different ID formats
-        if "/" in paper_id_full:
-            paper_id = paper_id_full.split("/")[-1]
+        # Handle different ID formats for arXiv
+        # Format could be:
+        # - http://arxiv.org/abs/physics/0609047v1 (old format with category)
+        # - http://arxiv.org/abs/2407.20030v1 (new format)
+        # - direct IDs like "2407.20030v1" or "physics/0609047v1"
+        
+        # First extract the ID part from the URL if needed
+        if "arxiv.org" in paper_id_full:
+            # Extract ID from URL
+            parts = paper_id_full.split("/abs/")
+            if len(parts) > 1:
+                paper_id = parts[1]
+            else:
+                # Try alternate format
+                parts = paper_id_full.split("/")
+                paper_id = parts[-1]
         else:
             paper_id = paper_id_full
+        
+        # For old-style IDs (with category prefix like "physics/0609047v1")
+        # Format correctly for arXiv API
+        if "/" in paper_id and not paper_id.startswith("http"):
+            # This is already in the correct format for arXiv API, just remove version if present
+            if "v" in paper_id.split("/")[1]:
+                category_parts = paper_id.split("/")
+                id_part = category_parts[1]
+                version_parts = id_part.split("v")
+                clean_id = f"{category_parts[0]}/{version_parts[0]}"
+                logger.info(f"[EXTRACT] Formatted old-style ID with category: '{paper_id}' -> '{clean_id}'")
+                return clean_id
+            return paper_id  # Already in correct format
             
-        # Remove version if present
-        if paper_id and "v" in paper_id:
-            original_id = paper_id
-            paper_id = paper_id.split("v")[0]
-            logger.info(f"[EXTRACT] Removed version from ID: '{original_id}' -> '{paper_id}'")
-            
+        # For new-style IDs (just numbers like "2407.20030v1")
+        # Handle version numbers if present
+        if "v" in paper_id and not paper_id.startswith("http"):
+            version_parts = paper_id.split("v")
+            clean_id = version_parts[0]  # Remove version number
+            logger.info(f"[EXTRACT] Removed version from ID: '{paper_id}' -> '{clean_id}'")
+            paper_id = clean_id
+        
         logger.info(f"[EXTRACT] Final extracted paper ID: '{paper_id}'")
         return paper_id
     
@@ -639,19 +796,37 @@ class ArxivResearchAgent(AbstractAgent):
             response_handler: ResponseHandler,
             session: Session
     ):
-        """Handle the response for a search query."""
+        """Enhanced handler for search responses that adds context about filters."""
         logger.info("[RESPONSE] Handling search response")
         
         # Extract info from result
         query = result["query"]
         count = result["count"]
         search_results = result["results"]
+        filters = result.get("filters", {})
         
-        logger.info(f"[RESPONSE] Search results - Query: '{query}', Count: {count}")
+        # Extract filter information for the response
+        author_filter = filters.get("author")
+        topic_filter = filters.get("topic")
+        date_filter = filters.get("date_range")
+        
+        logger.info(f"[RESPONSE] Search results - Query: '{query}', Count: {count}, Filters: {filters}")
+        
+        # Create notification message that includes filter information
+        search_message = f"Searching arXiv for papers"
+        if query:
+            search_message += f" about {query}"
+        if author_filter:
+            search_message += f" by author {author_filter}"
+        if topic_filter:
+            search_message += f" in category {topic_filter}"
+        if date_filter:
+            search_message += f" from {date_filter}"
+        search_message += "..."
         
         # Notify user about the search
         await response_handler.emit_text_block(
-            "SEARCH", f"Searching arXiv for papers about {query}..."
+            "SEARCH", search_message
         )
         
         # Emit search results as JSON
@@ -665,7 +840,7 @@ class ArxivResearchAgent(AbstractAgent):
                 # Create summary of search results
                 logger.info("[RESPONSE] Generating search summary")
                 summary_stream = response_handler.create_text_stream("SEARCH_SUMMARY")
-                async for chunk in self._generate_search_summary(query, search_results):
+                async for chunk in self._generate_search_summary(query, search_results, author=author_filter):
                     filtered_chunk = self._filter_inappropriate_content(chunk)
                     await summary_stream.emit_chunk(filtered_chunk)
                 await summary_stream.complete()
@@ -680,8 +855,16 @@ class ArxivResearchAgent(AbstractAgent):
             try:
                 # Generate a concise, customized response that doesn't sound templated
                 logger.info("[RESPONSE] Generating final response")
+                
+                # Build a prompt that includes filter context
+                prompt_context = f'related to "{query}"' if query else ""
+                if author_filter:
+                    prompt_context = f'by author {author_filter}'
+                    if query:
+                        prompt_context += f' related to "{query}"'
+                
                 prompt = f"""
-                Generate a natural, conversational response about the papers I found related to "{query}".
+                Generate a natural, conversational response about the papers I found {prompt_context}.
                 
                 I found {count} papers. The most relevant is "{search_results[0]['title']}" by {', '.join(search_results[0]['authors'][:2])}.
                 
@@ -725,11 +908,16 @@ class ArxivResearchAgent(AbstractAgent):
                 
                 # Fallback to a manual response
                 most_relevant = search_results[0]
-                fallback_response = f"""
-                My search for "{query}" found {count} relevant papers. The most notable is "{most_relevant['title']}" by {', '.join(most_relevant['authors'][:2])}, which explores {most_relevant['summary'][:100]}...
                 
-                Would you like more details about this paper?
-                """
+                # Build fallback response that includes filter context
+                fallback_response = f"My search"
+                if author_filter:
+                    fallback_response += f" for papers by {author_filter}"
+                if query:
+                    fallback_response += f' on "{query}"'
+                    
+                fallback_response += f" found {count} relevant papers. The most notable is \"{most_relevant['title']}\" by {', '.join(most_relevant['authors'][:2])}, which explores {most_relevant['summary'][:100]}...\n\nWould you like more details about this paper?"
+                
                 logger.info("[RESPONSE] Using fallback response")
                 await final_response_stream.emit_chunk(fallback_response)
                 
@@ -737,14 +925,30 @@ class ArxivResearchAgent(AbstractAgent):
         else:
             # No results found
             logger.info("[RESPONSE] No search results found")
+            
+            # Create error message that includes filter context
+            no_results_message = "No papers found"
+            if author_filter:
+                no_results_message += f" by author {author_filter}"
+            if query:
+                no_results_message += f" matching your query about {query}"
+            no_results_message += " on arXiv."
+            
             await response_handler.emit_text_block(
-                "NO_RESULTS", f"No papers found matching your query on arXiv."
+                "NO_RESULTS", no_results_message
             )
             
             final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+            
+            # Build suggestion based on filters
+            suggestion = ""
+            if author_filter:
+                suggestion = "Try checking the spelling of the author name or searching for a different author."
+            else:
+                suggestion = "Perhaps try a different search term or check if your query is too specific."
+            
             await final_response_stream.emit_chunk(
-                f"I couldn't find any papers on arXiv matching your query about {query}. "
-                f"Perhaps try a different search term or check if your query is too specific."
+                f"I couldn't find any papers{' by ' + author_filter if author_filter else ''}{' about ' + query if query else ''} on arXiv. {suggestion}"
             )
             await final_response_stream.complete()
         
@@ -830,6 +1034,7 @@ class ArxivResearchAgent(AbstractAgent):
                     2. Highlight 2-3 key points from the abstract
                     3. Mention the paper's significance to the field
                     4. Use formal academic language (no profanity or slang)
+                    5. Mention that the user can ask to find more papers by the same author
                     
                     EXTREMELY IMPORTANT: DO NOT use informal language, slang, or profanity of any kind. Keep your language strictly professional and academic.
                     DO NOT start with phrases like "Here are the details" or "Here are the detailed information".
@@ -870,6 +1075,8 @@ class ArxivResearchAgent(AbstractAgent):
                     {summary}
                     
                     You can access this paper at {paper['arxiv_url']} or download the PDF from {paper['pdf_url']}.
+                    
+                    If you'd like to see more papers by {paper['authors'][0]}, just ask.
                     """
                     logger.info("[RESPONSE] Using fallback paper details response")
                     await final_response_stream.emit_chunk(fallback_response)
@@ -894,6 +1101,7 @@ class ArxivResearchAgent(AbstractAgent):
                     3. Mention the paper's access links
                     4. Sound natural, not like a template
                     5. Use formal academic language (no profanity or slang)
+                    6. Mention that the user can ask to find more papers by the first author
                     
                     EXTREMELY IMPORTANT: DO NOT use informal language, slang or profanity of any kind. Keep your language strictly professional and academic.
                     DO NOT start with phrases like "I found the paper you requested".
@@ -934,6 +1142,8 @@ class ArxivResearchAgent(AbstractAgent):
                     {summary[:300]}...
                     
                     You can access this paper at {paper['arxiv_url']} or download the PDF from {paper['pdf_url']}.
+                    
+                    If you'd like to see more papers by {paper['authors'][0]}, just ask.
                     """
                     logger.info("[RESPONSE] Using fallback paper response")
                     await final_response_stream.emit_chunk(fallback_response)
@@ -948,10 +1158,30 @@ class ArxivResearchAgent(AbstractAgent):
                 "ERROR", f"Could not find the paper: {error}"
             )
             
+            # Create a more helpful error response
             final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-            await final_response_stream.emit_chunk(
-                f"I couldn't find the paper with ID {paper_id} on arXiv. Please check if the ID is correct and try again."
-            )
+            
+            # Check if we have previous search results to recommend
+            if "last_papers" in session.metadata and len(session.metadata["last_papers"]) > 0:
+                papers = session.metadata["last_papers"]
+                fallback_response = f"""
+                I couldn't find the specific paper with ID {paper_id}. This might be due to an error in the ID format or the paper may not be available on arXiv.
+                
+                However, based on your previous search, I can tell you about these papers instead:
+                
+                "{papers[0]['title']}" by {', '.join(papers[0]['authors'][:2])}
+                "{papers[1]['title']}" by {', '.join(papers[1]['authors'][:2])}
+                
+                Would you like me to get details about one of these papers instead?
+                """
+                logger.info("[RESPONSE] Using fallback with suggested papers")
+                await final_response_stream.emit_chunk(fallback_response)
+            else:
+                # Basic error if no previous results
+                await final_response_stream.emit_chunk(
+                    f"I couldn't find the paper with ID {paper_id} on arXiv. This might be due to an error in the ID format or the paper might not be accessible. Please check if the ID is correct and try again, or try searching for the paper by its title."
+                )
+            
             await final_response_stream.complete()
         
         # Mark response as complete
@@ -1007,6 +1237,7 @@ class ArxivResearchAgent(AbstractAgent):
             3. Sound natural and knowledgeable
             4. Use formal academic language (absolutely no profanity or slang)
             5. Be thorough but concise
+            6. If relevant, mention that the user can ask to find more papers by the first author
             
             EXTREMELY IMPORTANT: DO NOT use informal language, slang or profanity of any kind. Keep your language strictly professional and academic.
             """
@@ -1043,6 +1274,8 @@ class ArxivResearchAgent(AbstractAgent):
             Based on the abstract, the paper focuses on {summary[:150]}...
             
             You can access the full paper at {paper['arxiv_url']} for more details.
+            
+            If you'd like to see more papers by {paper['authors'][0]}, feel free to ask.
             """
             logger.info("[RESPONSE] Using fallback follow-up response")
             await final_response_stream.emit_chunk(fallback_response)
@@ -1065,24 +1298,57 @@ class ArxivResearchAgent(AbstractAgent):
         description = result["description"]
         capabilities = result["capabilities"]
         
-        final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-        
-        # Create a concise, informative response about the agent
-        response = f"""
-I am {name}, an AI research assistant specialized in finding and explaining scientific papers from arXiv. 
+        # Create a prompt for the LLM to generate a more natural response about the agent
+        try:
+            prompt = f"""
+            Generate a natural, conversational response explaining who you are as {name}.
+            
+            About you:
+            {description}
+            
+            Your capabilities:
+            {', '.join(capabilities)}
+            
+            Make your response:
+            1. Sound natural and conversational
+            2. Be informative about what you can help with
+            3. Invite the user to ask about papers they're interested in
+            4. Be friendly but professional
+            5. Do not use bullet points or lists
+            """
+            
+            system_prompt = (
+                "You are a helpful research assistant specializing in scientific papers. "
+                "Your responses are natural, helpful, and inviting. "
+                "You explain your capabilities clearly but conversationally."
+            )
+            
+            logger.info("[RESPONSE] Generating agent info response with LLM")
+            response = await self._model_provider.query(prompt, system_prompt)
+            
+            # Create final response stream
+            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+            await final_response_stream.emit_chunk(response)
+            await final_response_stream.complete()
+            
+        except Exception as e:
+            logger.error(f"[RESPONSE] Error generating LLM agent info: {str(e)}")
+            
+            # Fall back to template response if LLM fails
+            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+            
+            # Create a concise, informative response about the agent
+            fallback_response = f"""
+            I am {name}, an AI research assistant specialized in finding and explaining scientific papers from arXiv. 
 
-I can help you:
-- Search for papers on specific topics
-- Retrieve and explain individual papers by ID
-- Summarize research findings in accessible language
-- Provide academic context for search results
+            I can help you search for papers on specific topics, retrieve and explain individual papers by ID, find papers by specific authors, summarize research findings, and provide academic context for search results.
 
-Just ask me to find papers on a topic you're interested in, and I'll help you explore the research.
-        """
-        
-        logger.info("[RESPONSE] Sending agent info response")
-        await final_response_stream.emit_chunk(response)
-        await final_response_stream.complete()
+            Just ask me to find papers on a topic you're interested in, and I'll help you explore the research.
+            """
+            
+            logger.info("[RESPONSE] Using fallback agent info response")
+            await final_response_stream.emit_chunk(fallback_response)
+            await final_response_stream.complete()
         
         # Mark response as complete
         await response_handler.complete()
@@ -1096,26 +1362,51 @@ Just ask me to find papers on a topic you're interested in, and I'll help you ex
         """Handle greeting responses."""
         logger.info("[RESPONSE] Handling greeting response")
         
-        final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-        
-        responses = [
-            "Hello! I'm your arXiv research assistant. What papers would you like me to find for you today?",
-            "Hi there! I can help you search for scientific papers on arXiv. What topic are you interested in?",
-            "Greetings! I'm here to help with your research. What scientific papers would you like to explore?",
-            "Hello! Ready to dive into some research? Tell me what papers you're looking for."
-        ]
-        
-        # Choose a random response for variety
-        response = random.choice(responses)
-        logger.info(f"[RESPONSE] Selected greeting response: '{response}'")
-        
-        await final_response_stream.emit_chunk(response)
-        await final_response_stream.complete()
+        # Try to use the LLM for a more varied greeting
+        try:
+            prompt = """
+            Generate a friendly, brief greeting as a research assistant. 
+            Welcome the user and ask what papers or research topics they'd like to explore.
+            Keep it to 1-2 sentences, sound natural and varied (not templated).
+            """
+            
+            system_prompt = (
+                "You are a helpful research assistant specializing in finding and explaining scientific papers. "
+                "Your responses are brief, friendly, and conversational."
+            )
+            
+            logger.info("[RESPONSE] Generating LLM greeting response")
+            response = await self._model_provider.query(prompt, system_prompt)
+            
+            # Create final response stream
+            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+            await final_response_stream.emit_chunk(response)
+            await final_response_stream.complete()
+            
+        except Exception as e:
+            logger.error(f"[RESPONSE] Error generating LLM greeting: {str(e)}")
+            
+            # Fall back to template responses if LLM fails
+            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+            
+            responses = [
+                "Hello! I'm your arXiv research assistant. What papers would you like me to find for you today?",
+                "Hi there! I can help you search for scientific papers on arXiv. What topic are you interested in?",
+                "Greetings! I'm here to help with your research. What scientific papers would you like to explore?",
+                "Hello! Ready to dive into some research? Tell me what papers you're looking for."
+            ]
+            
+            # Choose a random response for variety
+            response = random.choice(responses)
+            logger.info(f"[RESPONSE] Selected fallback greeting response: '{response}'")
+            
+            await final_response_stream.emit_chunk(response)
+            await final_response_stream.complete()
         
         # Mark response as complete
         await response_handler.complete()
         logger.info("[RESPONSE] Greeting response complete")
-    
+
     async def _handle_error_response(
             self,
             error_message: str,
@@ -1138,13 +1429,117 @@ Just ask me to find papers on a topic you're interested in, and I'll help you ex
         await response_handler.complete()
         logger.info("[RESPONSE] Error response complete")
     
+    async def _handle_list_all_papers_response(
+            self,
+            session: Session,
+            response_handler: ResponseHandler
+    ):
+        """
+        Handle requests to list all papers from previous searches.
+        This combines papers from multiple searches if available.
+        """
+        logger.info("[RESPONSE] Handling list all papers request")
+        
+        # Get the most recent search results
+        last_papers = session.metadata.get("last_papers", [])
+        previous_search_query = session.metadata.get("last_query", "your search")
+        
+        if not last_papers:
+            await response_handler.emit_text_block(
+                "NO_RESULTS", "No papers found in your previous searches."
+            )
+            
+            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+            await final_response_stream.emit_chunk(
+                "I don't have any previous search results to show. Please try searching for papers first."
+            )
+            await final_response_stream.complete()
+            await response_handler.complete()
+            return
+        
+        # Emit the papers as JSON
+        await response_handler.emit_json(
+            "PAPERS", {"results": last_papers}
+        )
+        logger.info(f"[RESPONSE] Emitted {len(last_papers)} papers from previous search")
+        
+        # Create final response
+        final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+        
+        try:
+            # Generate a response listing all papers with brief descriptions
+            prompt = f"""
+            Create a concise, formatted list of the papers from the previous search on "{previous_search_query}".
+            
+            Here are the papers:
+            {json.dumps([{
+                "title": paper.get("title"),
+                "authors": ", ".join(paper.get("authors", [])[:2]),
+                "published": paper.get("published"),
+                "summary": paper.get("summary", "")[:100] + "..."
+            } for paper in last_papers], indent=2)}
+            
+            For each paper:
+            1. Start with the title in quotes, followed by the authors
+            2. Add a very brief (1 sentence) description of what the paper is about
+            3. Number each paper entry
+            
+            At the end, mention that the user can ask for more details about any specific paper.
+            Use formal academic language throughout.
+            """
+            
+            system_prompt = (
+                "You are a professional academic research assistant. "
+                "Your responses are clear, organized, and formatted for readability. "
+                "You help researchers identify papers of interest from search results."
+            )
+            
+            logger.info("[RESPONSE] Generating list all papers response")
+            response = await self._model_provider.query(prompt, system_prompt)
+            
+            # Apply content filtering
+            filtered_response = self._filter_inappropriate_content(response)
+            
+            # Log a preview of the response
+            preview = filtered_response[:100] + "..." if len(filtered_response) > 100 else filtered_response
+            logger.info(f"[RESPONSE] List papers response preview: '{preview}'")
+            
+            await final_response_stream.emit_chunk(filtered_response)
+        except Exception as e:
+            logger.error(f"[RESPONSE] Error generating list papers response: {str(e)}")
+            logger.error(traceback.format_exc())
+            
+            # Fallback manual listing
+            fallback_response = f"Here are the papers from your search on \"{previous_search_query}\":\n\n"
+            
+            for i, paper in enumerate(last_papers):
+                fallback_response += f"{i+1}. \"{paper.get('title')}\" by {', '.join(paper.get('authors', [])[:2])}\n"
+            
+            fallback_response += "\nYou can ask for more details about any of these papers."
+            
+            logger.info("[RESPONSE] Using fallback list papers response")
+            await final_response_stream.emit_chunk(fallback_response)
+        
+        await final_response_stream.complete()
+        
+        # Mark response as complete
+        await response_handler.complete()
+        logger.info("[RESPONSE] List papers response handling complete")
+    
     async def _generate_search_summary(
             self,
             query: str,
-            papers: List[Dict[str, Any]]
+            papers: List[Dict[str, Any]],
+            author: str = None
     ) -> AsyncIterator[str]:
-        """Generate a summary of search results."""
-        logger.info(f"[SUMMARY] Generating search summary for query: '{query}'")
+        """Generate a summary of search results with enhanced context."""
+        context = f"search query: \"{query}\"" if query else "search"
+        if author:
+            context = f"search for papers by author \"{author}\""
+            if query:
+                context += f" related to \"{query}\""
+        
+        logger.info(f"[SUMMARY] Generating search summary for {context}")
         
         # Create a prompt for summarizing the search results
         papers_text = "\n\n".join([
@@ -1157,16 +1552,14 @@ Just ask me to find papers on a topic you're interested in, and I'll help you ex
         ])
         
         prompt = f"""
-        Based on the search query: "{query}"
-        
-        I found these papers on arXiv:
+        Based on the {context}, I found these papers on arXiv:
         
         {papers_text}
         
         Please provide:
         1. A formal academic overview of these research papers (2-3 sentences per paper)
-        2. How they relate to the search query (1-2 sentences)
-        3. Which papers might be most relevant to the search query and why (2-3 sentences)
+        2. How they relate to the {context} (1-2 sentences)
+        3. Which papers might be most relevant and why (2-3 sentences)
         
         Use professional academic language throughout. ABSOLUTELY DO NOT use informal language, slang, or profanity.
         """
@@ -1208,7 +1601,11 @@ Just ask me to find papers on a topic you're interested in, and I'll help you ex
             logger.error(traceback.format_exc())
             
             logger.info("[SUMMARY] Using fallback summary response")
-            simple_summary = f"Based on your query \"{query}\", I found {len(papers)} relevant papers:\n\n"
+            
+            author_context = f" by {author}" if author else ""
+            query_context = f" on \"{query}\"" if query else ""
+            
+            simple_summary = f"Based on your search{author_context}{query_context}, I found {len(papers)} relevant papers:\n\n"
             yield simple_summary
             
             for i, paper in enumerate(papers[:3]):
@@ -1221,10 +1618,53 @@ Just ask me to find papers on a topic you're interested in, and I'll help you ex
             logger.info("[SUMMARY] Fallback summary generation complete")
 
 
+# Modified DefaultServer implementation that properly manages sessions
+class ImprovedDefaultServer(DefaultServer):
+    """A DefaultServer that properly maintains client sessions."""
+    
+    def __init__(self, agent: AbstractAgent):
+        super().__init__(agent)
+        self.client_sessions = {}
+        logger.info("[SERVER] Initialized improved server with persistent client sessions")
+    
+    async def process_request(self, request_data: dict):
+        """Process a request with proper session management."""
+        # Always use the same client ID for all requests in testing
+        client_id = "default_user"
+        
+        # Get or create session for this client
+        if client_id in self.client_sessions:
+            session = self.client_sessions[client_id]
+            logger.info(f"[SERVER] Retrieved existing session for client {client_id}")
+        else:
+            session = Session()
+            session.metadata = {'client_id': client_id}
+            self.client_sessions[client_id] = session
+            logger.info(f"[SERVER] Created new session for client {client_id}")
+        
+        # Create query with client ID in context
+        query = Query(
+            prompt=request_data.get('prompt', ''),
+            context={'client_id': client_id}
+        )
+        
+        # Create response handler
+        response_handler = ResponseHandler()
+        
+        # Process the request using the agent
+        await self.agent.assist(session, query, response_handler)
+        
+        # Store updated session
+        self.client_sessions[client_id] = session
+        
+        # Return the response
+        return response_handler.get_response()
+
+
 if __name__ == "__main__":
     # Create an instance of the ArxivResearchAgent
     agent = ArxivResearchAgent(name="arXiv Research Agent")
-    # Create an improved server to handle requests to the agent with proper session management
+    # Create a server to handle requests to the agent
     server = ImprovedDefaultServer(agent)
     # Run the server
     server.run()
