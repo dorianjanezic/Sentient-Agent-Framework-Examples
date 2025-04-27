@@ -9,6 +9,7 @@ import uuid
 from enum import Enum
 from dotenv import load_dotenv
 from typing import AsyncIterator, List, Dict, Any, Optional, Tuple, Callable, Union
+from datetime import datetime
 
 from openai import RateLimitError, APIError, APITimeoutError
 
@@ -120,11 +121,6 @@ class Tools:
         """
         logger.info(f"[TOOL] search_papers called with query: '{query}', author: '{author}', topic: '{topic}', sort_by: '{sort_by}', category: '{category}'")
         
-        # Ensure session metadata exists
-        if not hasattr(session, "metadata") or session.metadata is None:
-            session.metadata = {'client_id': 'default_user'}
-            logger.info("[SESSION] Initialized empty session metadata")
-        
         # Build search query with filters
         search_query = query.strip()
         search_params = []
@@ -218,63 +214,34 @@ class Tools:
             for i, paper in enumerate(search_results[:3]):
                 logger.info(f"[TOOL] Paper {i+1}: '{paper.get('title')}' - ID: {paper.get('id')}")
             
-            # Store in session for context in future queries
-            if search_results:
-                session.metadata["last_papers"] = search_results
-                session.metadata["last_query"] = original_query  # Store original query
-                session.metadata["last_action"] = "search"
-                
-                # Store search parameters for context
-                session.metadata["search_params"] = {
-                    "query": query,
+            # Prepare result data
+            result_data = {
+                "type": "search_results",
+                "query": original_query,
+                "results": search_results,
+                "total_count": total_count,
+                "filters": {
                     "author": author,
                     "topic": topic,
                     "date_range": date_range,
                     "sort_by": sort_by,
                     "category": category
                 }
-                
-                # Ensure we're storing the session metadata persistently
-                await agent._update_session(session)
-                
-                logger.info(f"[SESSION] Stored {len(search_results)} papers in session")
-                
-                return {
-                    "type": "search_results",
-                    "query": original_query,
-                    "filters": {
-                        "author": author,
-                        "topic": topic,
-                        "date_range": date_range,
-                        "sort_by": sort_by,
-                        "category": category
-                    },
-                    "count": len(search_results),
-                    "total_count": total_count,
-                    "results": search_results
-                }
-            else:
-                logger.info("[TOOL] No search results found")
-                return {
-                    "type": "search_results",
-                    "query": original_query,
-                    "filters": {
-                        "author": author,
-                        "topic": topic,
-                        "date_range": date_range,
-                        "sort_by": sort_by,
-                        "category": category
-                    },
-                    "count": 0,
-                    "total_count": 0,
-                    "results": []
-                }
+            }
+            
+            # Update session state using the new management system
+            await agent._manage_session_state(session, "search", result_data)
+            
+            return result_data
+            
         except Exception as e:
             logger.error(f"[TOOL] Error in search_papers: {str(e)}")
             logger.error(traceback.format_exc())
             return {
                 "type": "search_results",
                 "query": original_query,
+                "results": [],
+                "total_count": 0,
                 "filters": {
                     "author": author,
                     "topic": topic,
@@ -282,9 +249,6 @@ class Tools:
                     "sort_by": sort_by,
                     "category": category
                 },
-                "count": 0,
-                "total_count": 0,
-                "results": [],
                 "error": str(e)
             }
     
@@ -308,11 +272,6 @@ class Tools:
             Dictionary with author profile and papers
         """
         logger.info(f"[TOOL] get_author_profile called with author: '{author_name}'")
-        
-        # Ensure session metadata exists
-        if not hasattr(session, "metadata") or session.metadata is None:
-            session.metadata = {'client_id': 'default_user'}
-            logger.info("[SESSION] Initialized empty session metadata")
         
         # Format the author query for arXiv
         author_query = f'au:"{author_name}"'
@@ -371,22 +330,19 @@ class Tools:
                 "publication_timeline": publication_timeline
             }
             
-            # Store in session for context in future queries
-            session.metadata["current_author"] = author_name
-            session.metadata["author_papers"] = author_papers
-            session.metadata["last_action"] = "author_profile"
-            
-            # Ensure we're storing the session metadata persistently
-            await agent._update_session(session)
-            
-            logger.info(f"[SESSION] Stored author profile in session")
-            
-            return {
+            # Prepare result data
+            result_data = {
                 "type": "author_profile",
                 "author": author_name,
                 "found": True,
-                "profile": profile
+                "profile": profile,
+                "papers": author_papers
             }
+            
+            # Update session state using the new management system
+            await agent._manage_session_state(session, "author_profile", result_data)
+            
+            return result_data
             
         except Exception as e:
             logger.error(f"[TOOL] Error fetching author profile for {author_name}: {str(e)}")
@@ -404,11 +360,6 @@ class Tools:
         """Get detailed information about a specific paper."""
         logger.info(f"[TOOL] get_paper_details called with paper_id: '{paper_id}'")
         
-        # Ensure session metadata exists
-        if not hasattr(session, "metadata") or session.metadata is None:
-            session.metadata = {'client_id': 'default_user'}
-            logger.info("[SESSION] Initialized empty session metadata")
-        
         # Get paper details
         try:
             # Extract a more specific part of paper_id to avoid errors
@@ -416,21 +367,19 @@ class Tools:
             paper = await agent._arxiv_provider.get_paper_by_id(paper_id)
             logger.info(f"[TOOL] Successfully retrieved paper: '{paper.get('title')}'")
             
-            # Store for future reference
-            session.metadata["current_paper"] = paper
-            session.metadata["last_action"] = "paper_detail"
-            
-            # Ensure we're storing the session metadata persistently
-            await agent._update_session(session)
-            
-            logger.info(f"[SESSION] Stored current_paper in session")
-            
-            return {
+            # Prepare result data
+            result_data = {
                 "type": "paper_detail",
                 "paper_id": paper_id,
-                "found": True,
-                "paper": paper
+                "paper": paper,
+                "found": True
             }
+            
+            # Update session state using the new management system
+            await agent._manage_session_state(session, "paper_detail", result_data)
+            
+            return result_data
+            
         except Exception as e:
             logger.error(f"[TOOL] Error fetching paper {paper_id}: {str(e)}")
             logger.error(traceback.format_exc())
@@ -441,16 +390,17 @@ class Tools:
                     if paper_id in paper.get('id', ''):
                         logger.info(f"[TOOL] Recovered paper from session: '{paper.get('title')}'")
                         
-                        session.metadata["current_paper"] = paper
-                        session.metadata["last_action"] = "paper_detail"
-                        await agent._update_session(session)
-                        
-                        return {
+                        result_data = {
                             "type": "paper_detail",
                             "paper_id": paper_id,
-                            "found": True,
-                            "paper": paper
+                            "paper": paper,
+                            "found": True
                         }
+                        
+                        # Update session state using the new management system
+                        await agent._manage_session_state(session, "paper_detail", result_data)
+                        
+                        return result_data
             
             return {
                 "type": "paper_detail",
@@ -521,16 +471,56 @@ class ArxivResearchAgent(AbstractAgent):
 
     async def _update_session(self, session: Session) -> None:
         """Ensure session metadata is stored persistently."""
+        # Ensure session metadata exists
         if not hasattr(session, 'metadata') or not session.metadata:
-            logger.warning("[SESSION] Cannot update session: no metadata found")
-            return
-            
-        # ALWAYS use the single default user ID for simple testing
-        client_id = "default_user"
+            session.metadata = {}
+            logger.info("[SESSION] Initialized empty session metadata in _update_session")
         
-        # Store session metadata using the fixed client ID
-        self._session_store[client_id] = session.metadata
-        logger.info(f"[SESSION] Updated persistent session store for client {client_id}")
+        # Get activity_id from session metadata or context
+        activity_id = None
+        if hasattr(session, '_session_object'):
+            # Try to get activity_id from session object
+            activity_id = getattr(session._session_object, 'activity_id', None)
+            if activity_id:
+                session.metadata['activity_id'] = str(activity_id)
+                logger.info(f"[SESSION] Set activity_id from session object: {activity_id}")
+        
+        # If still no activity_id, try to get it from metadata
+        if not activity_id:
+            activity_id = session.metadata.get('activity_id')
+            if not activity_id:
+                logger.warning("[SESSION] No activity_id found in session metadata")
+                return
+        
+        # Store session metadata using the activity ID
+        self._session_store[activity_id] = session.metadata
+        logger.info(f"[SESSION] Updated persistent session store for activity {activity_id}")
+
+    async def _manage_session_state(self, session: Session, action: str, data: Dict[str, Any] = None) -> None:
+        """Manage session state based on actions."""
+        if not hasattr(session, 'metadata') or not session.metadata:
+            session.metadata = {'activity_id': 'unknown'}
+            logger.info("[SESSION] Initialized session metadata in _manage_session_state")
+        
+        # Ensure activity_id is set in metadata
+        if 'activity_id' not in session.metadata:
+            session.metadata['activity_id'] = 'unknown'
+        
+        if action == "search":
+            if data and 'query' in data:
+                session.metadata['last_search_query'] = data['query']
+                session.metadata['last_search_time'] = datetime.now().isoformat()
+        elif action == "paper_detail":
+            if data and 'paper_id' in data:
+                session.metadata['last_viewed_paper'] = data['paper_id']
+                session.metadata['last_viewed_time'] = datetime.now().isoformat()
+        elif action == "author_profile":
+            if data and 'author_id' in data:
+                session.metadata['last_viewed_author'] = data['author_id']
+                session.metadata['last_viewed_time'] = datetime.now().isoformat()
+        
+        # Update session in persistent store
+        await self._update_session(session)
 
     def _filter_inappropriate_content(self, text: str) -> str:
         """Filter out inappropriate language from model responses."""
@@ -574,182 +564,92 @@ class ArxivResearchAgent(AbstractAgent):
             query: Query,
             response_handler: ResponseHandler
     ):
-        """
-        Process the user query and provide research assistance.
-        
-        Args:
-            session: Session information
-            query: User query
-            response_handler: Handler for sending responses
-        """
-        logger.info(f"[ASSIST] Received query: '{query.prompt}'")
-        
+        """Handle incoming requests and manage session state."""
         try:
-            # IMPORTANT: Always use a single fixed client ID for all requests
-            # This ensures all requests share the same conversation context
-            client_id = "default_user"
-            logger.info(f"[SESSION] Using fixed client ID: {client_id}")
+            # Log raw request data
+            print("\n" + "=" * 80)
+            print("[ASSIST] RAW REQUEST DATA:")
+            print(f"Session: {json.dumps(session.__dict__, indent=2, default=str)}")
+            print(f"Query: {json.dumps(query.__dict__, indent=2, default=str)}")
+            print("=" * 80 + "\n")
             
-            # Initialize session metadata if needed
-            if not hasattr(session, 'metadata') or session.metadata is None:
-                session.metadata = {}
+            # Classify the query
+            query_type, query_data = await self._classify_query(query.prompt, session)
             
-            # Store client ID in session metadata
-            session.metadata['client_id'] = client_id
-            
-            # Retrieve session data from global store if it exists
-            if client_id in self._session_store:
-                # Copy session data to preserve client_id
-                stored_metadata = self._session_store[client_id]
-                for key, value in stored_metadata.items():
-                    session.metadata[key] = value
-                logger.info(f"[SESSION] Retrieved session data for client {client_id}")
-            else:
-                logger.info(f"[SESSION] No existing session data for client {client_id}")
-            
-            # Log the current session state
-            self._log_session_state(session)
-            
-            # Step 1: Classify the query to determine intent
-            query_type, entities = await self._classify_query(query.prompt, session)
-            logger.info(f"[CLASSIFY] Query type: {query_type.value}, Entities: {entities}")
-            
-            # Step 2: Route to appropriate tool based on query type
+            # Handle the query based on its type
             if query_type == QueryType.SEARCH:
-                logger.info("[ROUTING] Handling as SEARCH query")
-                search_term = entities.get("search_term", query.prompt)
-                logger.info(f"[ROUTING] Search term: '{search_term}'")
-                
-                # Extract all relevant parameters from entities
-                author = entities.get("author")
-                category = entities.get("category")
-                date_range = entities.get("date_range")
-                sort_by = entities.get("sort_by")
-                
-                logger.info(f"[ROUTING] Using parameters - author: '{author}', category: '{category}', date_range: '{date_range}', sort_by: '{sort_by}'")
-                
-                # Call search_papers with all extracted parameters
                 result = await Tools.search_papers(
-                    search_term, 
-                    session, 
-                    self, 
-                    author=author,
-                    category=category,
-                    date_range=date_range,
-                    sort_by=sort_by
+                    query=query.prompt,
+                    session=session,
+                    agent=self,
+                    author=query_data.get('author'),
+                    topic=query_data.get('topic'),
+                    date_range=query_data.get('date_range'),
+                    sort_by=query_data.get('sort_by'),
+                    category=query_data.get('category')
                 )
-                
                 await self._handle_search_response(result, response_handler, session)
                 
             elif query_type == QueryType.PAPER_DETAIL:
-                logger.info("[ROUTING] Handling as PAPER_DETAIL query")
-                paper_id = entities.get("paper_id")
-                logger.info(f"[ROUTING] Paper ID: '{paper_id}'")
-                if paper_id:
-                    result = await Tools.get_paper_details(paper_id, session, self)
-                    await self._handle_paper_detail_response(result, response_handler, session)
-                else:
-                    logger.error("[ROUTING] No paper ID found in entities")
-                    await self._handle_error_response("Unable to identify a paper ID in the query.", response_handler)
+                paper_id = query_data.get('paper_id')
+                if not paper_id:
+                    await self._handle_error_response(
+                        "Please provide a paper ID or reference a paper from previous results.",
+                        response_handler
+                    )
+                    return
+                
+                result = await Tools.get_paper_details(paper_id, session, self)
+                await self._handle_paper_detail_response(result, response_handler, session)
                 
             elif query_type == QueryType.AUTHOR_PROFILE:
-                logger.info("[ROUTING] Handling as AUTHOR_PROFILE query")
-                # Fix: Check for both 'author' and 'author_name' in entities
-                author_name = entities.get("author") or entities.get("author_name")
-                logger.info(f"[ROUTING] Author name: '{author_name}'")
-                if author_name:
-                    result = await Tools.get_author_profile(author_name, session, self)
-                    await self._handle_author_profile_response(result, response_handler, session)
-                else:
-                    logger.error("[ROUTING] No author name found in entities")
-                    await self._handle_error_response("Unable to identify an author name in the query.", response_handler)
+                author_name = query_data.get('author_name')
+                if not author_name:
+                    await self._handle_error_response(
+                        "Please provide an author name to search for.",
+                        response_handler
+                    )
+                    return
+                
+                result = await Tools.get_author_profile(author_name, session, self)
+                await self._handle_author_profile_response(result, response_handler, session)
                 
             elif query_type == QueryType.FOLLOWUP:
-                logger.info("[ROUTING] Handling as FOLLOWUP query")
-                # Handle list all papers request
-                if "list_all_papers" in entities and entities["list_all_papers"]:
-                    logger.info("[ROUTING] Handling as LIST ALL PAPERS request")
-                    await self._handle_list_all_papers_response(session, response_handler)
-                else:
-                    # Determine what the follow-up is about based on previous action
-                    last_action = session.metadata.get("last_action")
-                    logger.info(f"[ROUTING] Last action: '{last_action}'")
-                    
-                    if last_action == "search" and "last_papers" in session.metadata and len(session.metadata["last_papers"]) > 0:
-                        # Follow-up about the most relevant paper from previous search
-                        most_relevant_paper = session.metadata["last_papers"][0]
-                        logger.info(f"[ROUTING] Most relevant paper: '{most_relevant_paper.get('title')}'")
-                        
-                        paper_id = self._extract_paper_id(most_relevant_paper)
-                        logger.info(f"[ROUTING] Extracted paper ID: '{paper_id}'")
-                        
-                        if paper_id:
-                            result = await Tools.get_paper_details(paper_id, session, self)
-                            await self._handle_paper_detail_response(result, response_handler, session, is_followup=True)
-                        else:
-                            logger.error("[ROUTING] Failed to extract paper ID from most relevant paper")
-                            await self._handle_error_response("Sorry, I couldn't find the paper details from our previous conversation.", response_handler)
-                    elif last_action == "paper_detail" and "current_paper" in session.metadata:
-                        # Follow-up about the current paper
-                        logger.info("[ROUTING] Following up on current paper")
-                        paper = session.metadata["current_paper"]
-                        await self._handle_paper_followup_response(paper, query.prompt, response_handler, session)
-                    else:
-                        logger.error(f"[ROUTING] Cannot determine follow-up context. Last action: '{last_action}', Has last_papers: {('last_papers' in session.metadata)}")
-                        # Can't determine what the follow-up is about
-                        await self._handle_error_response("I'm not sure what you're asking about. Could you provide more details?", response_handler)
-            
+                if not session.metadata.get('last_papers'):
+                    await self._handle_error_response(
+                        "No previous search results found. Please perform a search first.",
+                        response_handler
+                    )
+                    return
+                
+                await self._handle_paper_followup_response(
+                    session.metadata['last_papers'][0],
+                    query.prompt,
+                    response_handler,
+                    session
+                )
+                
             elif query_type == QueryType.AGENT_INFO:
-                logger.info("[ROUTING] Handling as AGENT_INFO query")
                 result = await Tools.get_agent_info(query.prompt, session, self)
                 await self._handle_agent_info_response(result, response_handler)
                 
             elif query_type == QueryType.GREETING:
-                logger.info("[ROUTING] Handling as GREETING query")
                 await self._handle_greeting_response(query.prompt, response_handler)
                 
-            else:  # QueryType.UNKNOWN
-                logger.info("[ROUTING] Handling as UNKNOWN query")
-                # For unknown queries, have the LLM respond directly
-                try:
-                    prompt = f"""
-                    The user has asked something that doesn't clearly fit into a specific query type.
-                    Please provide a helpful response that:
-                    1. Acknowledges their query
-                    2. Explains what types of queries you can help with
-                    3. Gives examples of how they can phrase their request
-                    4. Maintains a professional, academic tone
-                    
-                    User's query: {query.prompt}
-                    """
-                    
-                    system_prompt = (
-                        "You are a helpful research assistant specializing in finding and explaining scientific papers. "
-                        "When you receive unclear queries, you help guide users to better express their research needs."
-                    )
-                    
-                    logger.info("[RESPONSE] Generating response for unknown query")
-                    response = await self._model_provider.query(prompt, system_prompt)
-                    
-                    # Create final response stream
-                    final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-                    await final_response_stream.emit_chunk(response)
-                    await final_response_stream.complete()
-                    
-                except Exception as e:
-                    logger.error(f"[RESPONSE] Error generating response for unknown query: {str(e)}")
-                    await self._handle_error_response(
-                        "I'm not sure how to help with that. You can ask me to search for papers on a topic, get details about a specific paper, or ask for help using this system.",
-                        response_handler
-                    )
-                
-            # Make sure to update the session store after handling the query
+            else:
+                await self._handle_error_response(
+                    "I couldn't understand your request. Please try rephrasing it.",
+                    response_handler
+                )
+            
+            # Update session state
             await self._update_session(session)
             
+            # Mark response as complete
+            await response_handler.complete()
+            
         except Exception as e:
-            logger.error(f"[ERROR] Unexpected error in assist: {str(e)}")
-            logger.error(traceback.format_exc())
-            await self._handle_error_response(f"I encountered an unexpected error. Please try again.", response_handler)
+            await self._handle_error_response(str(e), response_handler)
     
     def _log_session_state(self, session: Session):
         """Log the current session state for debugging."""
@@ -1785,14 +1685,15 @@ IMPORTANT RULES:
         # Try to use the LLM for a more varied greeting
         try:
             prompt = """
-            Generate a friendly, brief greeting as a research assistant. 
-            Welcome the user and ask what papers or research topics they'd like to explore.
-            Keep it to 1-2 sentences, sound natural and varied (not templated).
+            Generate a friendly, brief greeting as an arXiv research agent. 
+            Introduce yourself as an AI agent that can help users find and understand scientific papers from arXiv.
+            Explain that you can search for papers, provide details about specific papers, help explore research topics, and look up author profiles and their publication history.
+            Keep it to 2-3 sentences, sound natural and varied (not templated).
             """
             
             system_prompt = (
-                "You are a helpful research assistant specializing in finding and explaining scientific papers. "
-                "Your responses are brief, friendly, and conversational."
+                "You are an AI research agent specializing in finding and explaining scientific papers from arXiv. "
+                "Your responses are brief, friendly, and conversational while maintaining a professional tone."
             )
             
             logger.info("[RESPONSE] Generating LLM greeting response")
@@ -2299,40 +2200,85 @@ class ImprovedDefaultServer(DefaultServer):
     def __init__(self, agent: AbstractAgent):
         super().__init__(agent)
         self.client_sessions = {}
-        logger.info("[SERVER] Initialized improved server with persistent client sessions")
     
     async def process_request(self, request_data: dict):
         """Process a request with proper session management."""
-        # Always use the same client ID for all requests in testing
-        client_id = "default_user"
-        
-        # Get or create session for this client
-        if client_id in self.client_sessions:
-            session = self.client_sessions[client_id]
-            logger.info(f"[SERVER] Retrieved existing session for client {client_id}")
-        else:
-            session = Session()
-            session.metadata = {'client_id': client_id}
+        try:
+            # Log the raw request data
+            print("\n" + "=" * 80)
+            print("[SERVER] RAW REQUEST DATA:")
+            print(json.dumps(request_data, indent=2, default=str))
+            print("=" * 80 + "\n")
+            
+            # Extract request information
+            processor_id = request_data.get('processor_id', 'unknown')
+            activity_id = request_data.get('activity_id', 'unknown')
+            request_id = request_data.get('request_id', 'unknown')
+            interactions = request_data.get('interactions', [])
+            
+            # Check if we have any interactions
+            if not interactions:
+                return {
+                    "error": "No interactions provided",
+                    "status": "error",
+                    "message": "Request must include interactions"
+                }
+            
+            # Use activity_id as client_id for session management
+            client_id = activity_id
+            
+            # Get or create session for this client
+            if client_id in self.client_sessions:
+                session = self.client_sessions[client_id]
+            else:
+                session = Session()
+                session.metadata = {
+                    'client_id': client_id,
+                    'processor_id': processor_id,
+                    'activity_id': activity_id,
+                    'request_id': request_id,
+                    'interactions': []
+                }
+                self.client_sessions[client_id] = session
+            
+            # Update session with current interactions
+            if not hasattr(session, 'metadata'):
+                session.metadata = {}
+            session.metadata['interactions'] = session.metadata.get('interactions', []) + interactions
+            
+            # Create query with context
+            query = Query(
+                prompt=request_data.get('prompt', ''),
+                context={
+                    'client_id': client_id,
+                    'processor_id': processor_id,
+                    'activity_id': activity_id,
+                    'request_id': request_id,
+                    'interactions': interactions
+                }
+            )
+            
+            # Create response handler
+            response_handler = ResponseHandler()
+            
+            # Process the request using the agent
+            await self.agent.assist(session, query, response_handler)
+            
+            # Store updated session
             self.client_sessions[client_id] = session
-            logger.info(f"[SERVER] Created new session for client {client_id}")
-        
-        # Create query with client ID in context
-        query = Query(
-            prompt=request_data.get('prompt', ''),
-            context={'client_id': client_id}
-        )
-        
-        # Create response handler
-        response_handler = ResponseHandler()
-        
-        # Process the request using the agent
-        await self.agent.assist(session, query, response_handler)
-        
-        # Store updated session
-        self.client_sessions[client_id] = session
-        
-        # Return the response
-        return response_handler.get_response()
+            
+            # Get the response
+            response = response_handler.get_response()
+            
+            return response
+            
+        except Exception as e:
+            # Return an error response
+            return {
+                "error": str(e),
+                "status": "error",
+                "message": "Failed to process request"
+            }
 
 
 if __name__ == "__main__":

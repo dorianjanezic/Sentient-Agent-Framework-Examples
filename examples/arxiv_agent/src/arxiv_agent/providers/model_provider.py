@@ -29,7 +29,7 @@ class ModelProvider:
         # Identifier for specific model that should be used
         self.model = model
         # Temperature setting for response randomness
-        self.temperature = 0.0
+        self.temperature = 0.2
         # Maximum number of tokens for responses
         self.max_tokens = None
         
