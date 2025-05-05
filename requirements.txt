@@ -1,0 +1,5 @@
+python-dotenv>=1.0.0
+openai>=1.0.0
+langchain-core>=0.1.0
+arxiv>=1.4.7
+uvicorn>=0.24.0 

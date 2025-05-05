@@ -26,9 +26,7 @@ class ArxivProvider:
             sort_by: How to sort results - "relevance", "lastUpdatedDate", or "submittedDate"
             
         Returns:
-            Dictionary containing:
-            - results: List of paper metadata dictionaries
-            - total_count: Total number of matching papers (if available)
+            List of paper metadata dictionaries
         """
         # Map sort_by string to arxiv library's SortCriterion
         sort_criterion = {
@@ -65,19 +63,7 @@ class ArxivProvider:
             }
             results.append(paper_dict)
         
-        # Try to get total count of matching papers
-        total_results_count = None
-        try:
-            # The search object might have metadata about total results
-            total_results_count = search.total_results
-        except AttributeError:
-            # If not available directly, we can only report what we have
-            total_results_count = len(results)
-        
-        return {
-            "results": results,
-            "total_count": total_results_count
-        }
+        return results
     
     async def get_paper_by_id(self, paper_id: str) -> Dict[str, Any]:
         """
