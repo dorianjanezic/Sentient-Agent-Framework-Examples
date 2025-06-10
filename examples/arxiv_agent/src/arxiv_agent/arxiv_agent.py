@@ -9,7 +9,7 @@ import uuid
 from enum import Enum
 from dotenv import load_dotenv
 from typing import AsyncIterator, List, Dict, Any, Optional, Tuple, Callable, Union
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from openai import RateLimitError, APIError, APITimeoutError
 import arxiv
@@ -49,6 +49,7 @@ class QueryType(Enum):
     FOLLOWUP = "followup"      # Follow-up question about previous results
     AGENT_INFO = "agent_info"  # Questions about the agent itself
     GREETING = "greeting"      # Hello, hi, etc.
+    GENERAL_EXPLANATION = "general_explanation"  # Open-ended discussion
     UNKNOWN = "unknown"        # Couldn't classify
 
 # List of words to filter from model responses
@@ -122,8 +123,35 @@ class Tools:
         """
         logger.info(f"[TOOL] search_papers called with query: '{query}'")
         
+        # Get the explanation from the query classification if available
+        query_classification = session.metadata.get('last_classification', {})
+        classification_explanation = query_classification.get('explanation', '')
+        
+        if classification_explanation:
+            logger.info(f"[TOOL] Classification explanation: '{classification_explanation}'")
+        
+        # First, transform the query to better search terms using the LLM
+        base_search_terms = ""
+        if query:
+            # Pass the classification explanation to the transform method
+            base_search_terms = await agent._transform_query_to_search_terms(
+                query=query, 
+                classification_explanation=classification_explanation
+            )
+            logger.info(f"[TOOL] Transformed search query '{query}' into: '{base_search_terms}'")
+            
+            # If the query has been transformed to include date constraints, prefer date sorting
+            # This respects the LLM's output as the source of truth
+            if not sort_by and "submittedDate" in base_search_terms:
+                sort_by = "lastUpdatedDate"
+                logger.info(f"[TOOL] Using lastUpdatedDate sorting due to date constraint in transformed query")
+        
         # Build search parameters
         search_params = []
+        
+        # Add the transformed query if it exists
+        if base_search_terms:
+            search_params.append(f"({base_search_terms})")
         
         # Add author filter if provided
         if author:
@@ -150,11 +178,15 @@ class Tools:
                 'large language models': 'cs.LG',
                 'embeddings': 'cs.LG',
                 'transformer': 'cs.LG',
-                'attention': 'cs.LG'
+                'attention': 'cs.LG',
+                'quantum': 'quant-ph',
+                'quantum computing': 'quant-ph',
+                'quantum information': 'quant-ph',
+                'quantum mechanics': 'quant-ph'
             }
             
             # Prioritize category over topic if both are present
-            category_code = category if category else category_map.get(topic.lower(), None)
+            category_code = category if category else category_map.get(topic.lower() if topic else '', None)
             
             if category_code:
                 # Format category for arXiv search
@@ -167,15 +199,15 @@ class Tools:
         # Add date range filter if provided
         if date_range:
             # Convert friendly date range to arXiv format
-            if date_range == "last_day":
-                search_params.append("submittedDate:[NOW-1DAY TO NOW]")
-            elif date_range == "last_week":
-                search_params.append("submittedDate:[NOW-7DAYS TO NOW]")
-            elif date_range == "last_month":
-                search_params.append("submittedDate:[NOW-1MONTH TO NOW]")
-            elif date_range == "last_year":
-                search_params.append("submittedDate:[NOW-1YEAR TO NOW]")
-            # Support for custom date ranges (YYYY-MM-DD format)
+            date_map = {
+                "last_day": "submittedDate:[NOW-1DAY TO NOW]",
+                "last_week": "submittedDate:[NOW-7DAYS TO NOW]",
+                "last_month": "submittedDate:[NOW-1MONTH TO NOW]",
+                "last_year": "submittedDate:[NOW-1YEAR TO NOW]"
+            }
+            if date_range in date_map:
+                search_params.append(date_map[date_range])
+                logger.info(f"[TOOL] Added date range filter: {date_range}")
             elif "to" in date_range.lower():
                 try:
                     start_date, end_date = date_range.lower().split("to")
@@ -183,62 +215,9 @@ class Tools:
                     end_date = end_date.strip()
                     # Validate and format dates (implementation omitted)
                     search_params.append(f"submittedDate:[{start_date} TO {end_date}]")
+                    logger.info(f"[TOOL] Added custom date range filter: {date_range}")
                 except Exception as e:
                     logger.error(f"[TOOL] Error parsing custom date range: {str(e)}")
-            
-            logger.info(f"[TOOL] Added date range filter: {date_range}")
-        
-        # Add the main query if provided
-        if query:
-            # Try to use enhanced_search_term first if available
-            if hasattr(agent, '_last_classification') and 'enhanced_search_term' in agent._last_classification.get('entities', {}):
-                enhanced_query = agent._last_classification['entities']['enhanced_search_term']
-                # Ensure we only use the actual query part, not any explanation
-                if '(' in enhanced_query and ')' in enhanced_query:
-                    # Extract just the query part between parentheses
-                    query_start = enhanced_query.find('(')
-                    query_end = enhanced_query.rfind(')') + 1
-                    enhanced_query = enhanced_query[query_start:query_end]
-                logger.info(f"[TOOL] Using enhanced search query: '{enhanced_query}'")
-                search_params.append(enhanced_query)
-            else:
-                # Common words to filter out
-                common_words = {'in', 'the', 'a', 'an', 'and', 'or', 'for', 'to', 'of', 'with', 'by', 'on', 'at', 'from', 'as', 'is', 'are', 'be', 'was', 'were'}
-                
-                # Split query into terms and filter out common words
-                search_terms = [term for term in query.split() if term.lower() not in common_words]
-                
-                # Group related terms (e.g., "llm models" should stay together)
-                grouped_terms = []
-                i = 0
-                while i < len(search_terms):
-                    # Check if current term and next term form a common phrase
-                    if i + 1 < len(search_terms):
-                        potential_phrase = f"{search_terms[i]} {search_terms[i+1]}"
-                        if potential_phrase.lower() in {'llm models', 'language models', 'large language', 'neural networks', 'deep learning', 'machine learning'}:
-                            grouped_terms.append(potential_phrase)
-                            i += 2
-                            continue
-                    grouped_terms.append(search_terms[i])
-                    i += 1
-                
-                # Create search conditions for each term/phrase
-                title_conditions = []
-                abstract_conditions = []
-                
-                for term in grouped_terms:
-                    # If term contains a space, it's a phrase and needs quotes
-                    if ' ' in term:
-                        title_conditions.append(f'ti:"{term}"')
-                        abstract_conditions.append(f'abs:"{term}"')
-                    else:
-                        title_conditions.append(f'ti:{term}')
-                        abstract_conditions.append(f'abs:{term}')
-                
-                # Combine conditions with OR for each term
-                formatted_query = f'({" OR ".join(title_conditions)} OR {" OR ".join(abstract_conditions)})'
-                search_params.append(formatted_query)
-                logger.info(f"[TOOL] Using fallback search query: '{formatted_query}'")
         
         # Combine all search parameters
         final_query = " AND ".join(search_params) if search_params else "*"
@@ -246,7 +225,7 @@ class Tools:
         
         try:
             # Log the sorting parameter being used
-            sort_value = sort_by if sort_by else "submitteddate"
+            sort_value = sort_by if sort_by else "relevance"
             logger.info(f"[TOOL] Using sort_by: '{sort_value}'")
             
             # Execute the search
@@ -255,6 +234,93 @@ class Tools:
                 max_results=5,
                 sort_by=sort_value
             )
+            
+            # If we got very few results, try a less restrictive search
+            if len(search_results) < 2:
+                logger.info("[TOOL] Few results found, trying less restrictive search")
+                
+                # Make search less restrictive by using just the key terms
+                less_restrictive_terms = final_query
+                
+                # Replace exact phrase matching with regular term matching
+                less_restrictive_terms = less_restrictive_terms.replace('ti:"', 'ti:')
+                less_restrictive_terms = less_restrictive_terms.replace('abs:"', 'abs:')
+                less_restrictive_terms = less_restrictive_terms.replace('"', ' ')
+                
+                # Simplify the query if it has multiple AND terms
+                if less_restrictive_terms.count("AND") > 1:
+                    # Keep only essential filters (author, category, date range)
+                    parts = []
+                    core_terms = []
+                    
+                    for part in less_restrictive_terms.split(" AND "):
+                        if any(prefix in part for prefix in ['au:', 'cat:', 'submittedDate:']):
+                            parts.append(part)
+                        elif '(' in part and ')' in part:
+                            # This is likely our transformed query, extract key terms
+                            core_part = part.replace('(', '').replace(')', '')
+                            term_parts = core_part.split(" OR ")
+                            # Take a couple of key terms
+                            for term in term_parts[:2]:
+                                if not any(prefix in term for prefix in ['ti:', 'abs:']):
+                                    core_terms.append(term)
+                                else:
+                                    # Extract just the term without the prefix
+                                    term_clean = term.split(':', 1)[1] if ':' in term else term
+                                    core_terms.append(term_clean)
+                    
+                    # Add the core terms back with simpler structure
+                    if core_terms:
+                        core_query = " OR ".join(core_terms)
+                        parts.append(core_query)
+                    
+                    less_restrictive_terms = " AND ".join(parts)
+                
+                logger.info(f"[TOOL] Trying less restrictive search: '{less_restrictive_terms}'")
+                
+                less_restrictive_results = await agent._arxiv_provider.search(
+                    query=less_restrictive_terms,
+                    max_results=5,
+                    sort_by=sort_value
+                )
+                
+                if len(less_restrictive_results) > len(search_results):
+                    search_results = less_restrictive_results
+                    logger.info(f"[TOOL] Found {len(search_results)} papers with less restrictive search")
+            
+            # Generate a summary of the search results with the improved prompt
+            papers_text = "\n".join([
+                f"Title: {paper['title']}\nAuthors: {', '.join(paper['authors'])}\nPublished: {paper['published']}\nSummary: {paper['summary'][:200]}..."
+                for paper in search_results
+            ])
+            
+            task_instructions = """
+            Summarize arXiv search results, emphasizing relevance to the query.
+            Highlight thematic connections and suggest optional refinements.
+            """
+            
+            user_prompt = f"""
+            Query: {query}
+            Parameters:
+            - Author: {author or 'N/A'}
+            - Topic: {topic or 'N/A'}
+            - Date Range: {date_range or 'N/A'}
+            - Category: {category or 'N/A'}
+            - Sort By: {sort_by or 'relevance'}
+            
+            Papers:
+            {papers_text}
+            
+            Provide:
+            1. Brief summary of each paper (1-2 sentences)
+            2. Relevance to the query
+            3. Thematic connections
+            4. Optional refinements (e.g., "focus on NLP", "recent papers")
+            Number each summary.
+            """
+            
+            summary = await agent._model_provider.query(user_prompt, task_instructions)
+            filtered_summary = agent._filter_inappropriate_content(summary)
             
             # Store the results in session for future reference
             await agent._manage_session_state(
@@ -270,21 +336,16 @@ class Tools:
                 "topic": topic,
                 "date_range": date_range,
                 "sort_by": sort_by,
-                "category": category,
-                "sort_by": sort_by
+                "category": category
             }
             await agent._manage_session_state(session, "update", {"last_search_params": search_params})
             
-            # Return results with metadata
+            # Return results with metadata and summary
             return {
                 "query": query,
                 "results": search_results,
-                "filters": {
-                    "author": author,
-                    "topic": topic,
-                    "date_range": date_range,
-                    "category": category
-                }
+                "summary": filtered_summary,
+                "filters": search_params
             }
             
         except Exception as e:
@@ -293,6 +354,7 @@ class Tools:
             return {
                 "query": query,
                 "results": [],
+                "summary": f"Error searching for papers: {str(e)}",
                 "filters": {
                     "author": author,
                     "topic": topic,
@@ -380,13 +442,44 @@ class Tools:
                 "publication_timeline": publication_timeline
             }
             
+            # Generate a summary of the author profile with the improved prompt
+            papers_text = "\n".join([
+                f"Title: {paper['title']}\nPublished: {paper['published']}\nSummary: {paper['summary'][:150]}..."
+                for paper in author_papers[:5]
+            ])
+            
+            task_instructions = """
+            Generate author profiles, focusing on research focus and publication trends.
+            Suggest further exploration of papers or collaborators.
+            """
+            
+            user_prompt = f"""
+            Author: {author_name}
+            Paper Count: {profile['paper_count']}
+            Top Research Areas: {', '.join([item['category'] for item in profile['research_interests'][:3]])}
+            Publication Timeline: {', '.join([f'{item["year"]}: {item["papers"]} papers' for item in profile['publication_timeline']])}
+            Recent Papers:
+            {papers_text}
+            
+            Provide:
+            1. Research focus introduction
+            2. Publication trends analysis
+            3. Summary of 2-3 recent papers
+            4. Key collaborators
+            5. Field contributions
+            6. Suggested exploration (papers, authors)
+            """
+            
+            summary = await agent._model_provider.query(user_prompt, task_instructions)
+            filtered_summary = agent._filter_inappropriate_content(summary)
+            
             # Prepare result data
             result_data = {
                 "type": "author_profile",
                 "author": author_name,
                 "found": True,
                 "profile": profile,
-                "papers": author_papers
+                "summary": filtered_summary
             }
             
             # Update session state using the new management system
@@ -421,64 +514,135 @@ class Tools:
                 paper_id_clean = agent._extract_paper_id(paper)
                 if paper_id_clean and paper_id_clean == paper_id:
                     logger.info(f"[TOOL] Found exact matching paper by ID in last_papers: '{paper.get('title')}'")
-                    return {
-                        "type": "paper_detail",
-                        "paper_id": paper_id,
-                        "paper": paper,
-                        "found": True
-                    }
+                    return await agent._generate_paper_response(paper, paper_id, session)
                 
-                # If paper_id looks like a title, try to match it
-                if paper_id.lower() in paper.get('title', '').lower():
-                    logger.info(f"[TOOL] Found matching paper by title in last_papers: '{paper.get('title')}'")
-                    return {
-                        "type": "paper_detail",
-                        "paper_id": paper.get('id', ''),
-                        "paper": paper,
-                        "found": True
-                    }
+                # If paper_id looks like a title, try fuzzy matching
+                if paper_id and not any(c in paper_id for c in ["/", "."]) and len(paper_id.split()) > 1:
+                    paper_title = paper.get('title', '').lower()
+                    search_title = paper_id.lower()
+                    
+                    # Check for exact match first
+                    if search_title in paper_title:
+                        logger.info(f"[TOOL] Found exact matching paper by title in last_papers: '{paper.get('title')}'")
+                        return await agent._generate_paper_response(paper, paper.get('id', ''), session)
+                    
+                    # Try fuzzy matching if no exact match
+                    from difflib import SequenceMatcher
+                    similarity = SequenceMatcher(None, search_title, paper_title).ratio()
+                    if similarity > 0.8:  # 80% similarity threshold
+                        logger.info(f"[TOOL] Found fuzzy matching paper by title in last_papers: '{paper.get('title')}' (similarity: {similarity:.2f})")
+                        return await agent._generate_paper_response(paper, paper.get('id', ''), session)
         
         # If we didn't find it in last_papers and paper_id looks like a title, search for it
         if paper_id and not any(c in paper_id for c in ["/", "."]) and len(paper_id.split()) > 1:
             logger.info(f"[TOOL] Searching for paper by title: '{paper_id}'")
             try:
-                # Search for the paper by title
+                # First try exact title search
                 search_results = await agent._arxiv_provider.search(
                     f'ti:"{paper_id}"',
-                    max_results=1,
+                    max_results=5,  # Increased from 1 to allow for fuzzy matching
                     sort_by="relevance"
                 )
                 
                 if search_results and len(search_results) > 0:
-                    paper = search_results[0]
-                    logger.info(f"[TOOL] Found paper by title search: '{paper.get('title')}'")
+                    # If we have multiple results, try to find the best match
+                    best_match = None
+                    best_similarity = 0.8  # Minimum similarity threshold
+                    
+                    for paper in search_results:
+                        paper_title = paper.get('title', '').lower()
+                        search_title = paper_id.lower()
+                        
+                        # Check for exact match first
+                        if search_title in paper_title:
+                            best_match = paper
+                            best_similarity = 1.0
+                            break
+                        
+                        # Try fuzzy matching
+                        from difflib import SequenceMatcher
+                        similarity = SequenceMatcher(None, search_title, paper_title).ratio()
+                        if similarity > best_similarity:
+                            best_match = paper
+                            best_similarity = similarity
+                    
+                    if best_match:
+                        logger.info(f"[TOOL] Found matching paper by title search: '{best_match.get('title')}' (similarity: {best_similarity:.2f})")
+                        return await agent._generate_paper_response(best_match, best_match.get('id', ''), session)
+                    else:
+                        # If no good match found, try a broader search
+                        search_results = await agent._arxiv_provider.search(
+                            paper_id,  # Use the title as a general search term
+                            max_results=5,
+                            sort_by="relevance"
+                        )
+                        
+                        if search_results and len(search_results) > 0:
+                            # Try fuzzy matching on the broader results
+                            best_match = None
+                            best_similarity = 0.8
+                            
+                            for paper in search_results:
+                                paper_title = paper.get('title', '').lower()
+                                search_title = paper_id.lower()
+                                similarity = SequenceMatcher(None, search_title, paper_title).ratio()
+                                if similarity > best_similarity:
+                                    best_match = paper
+                                    best_similarity = similarity
+                            
+                            if best_match:
+                                logger.info(f"[TOOL] Found matching paper in broader search: '{best_match.get('title')}' (similarity: {best_similarity:.2f})")
+                                return await agent._generate_paper_response(best_match, best_match.get('id', ''), session)
+                
+                # If no match found, check if this might be a book or non-arXiv publication
+                if "introduction" in paper_id.lower() or "book" in paper_id.lower():
                     return {
                         "type": "paper_detail",
-                        "paper_id": paper.get('id', ''),
-                        "paper": paper,
-                        "found": True
+                        "paper_id": paper_id,
+                        "found": False,
+                        "error": "This appears to be a book or published work, not an arXiv paper. arXiv only contains academic papers and preprints. You may want to search for this work in a library catalog or academic database."
+                    }
+                else:
+                    return {
+                        "type": "paper_detail",
+                        "paper_id": paper_id,
+                        "found": False,
+                        "error": "Could not find this paper on arXiv. This could be because:\n1. It's not an arXiv paper (e.g., it's a published book or article)\n2. The title might be slightly different\n3. It might be in a different repository\n\nTry searching for academic papers on this topic instead."
                     }
             except Exception as e:
                 logger.error(f"[TOOL] Error searching for paper by title: {str(e)}")
         
         # If we didn't find it in last_papers or by title search, try to get it by ID
         try:
-            # Extract a more specific part of paper_id to avoid errors
-            paper = await agent._arxiv_provider.get_paper_by_id(paper_id)
-            logger.info(f"[TOOL] Successfully retrieved paper by ID: '{paper.get('title')}'")
-            
-            # Prepare result data
-            result_data = {
-                "type": "paper_detail",
-                "paper_id": paper_id,
-                "paper": paper,
-                "found": True
-            }
-            
-            # Update session state using the new management system
-            await agent._manage_session_state(session, "paper_detail", result_data)
-            
-            return result_data
+            # Only try to get by ID if it looks like an arXiv ID
+            if any(c in paper_id for c in ["/", "."]):
+                paper = await agent._arxiv_provider.get_paper_by_id(paper_id)
+                if "error" in paper:
+                    return {
+                        "type": "paper_detail",
+                        "paper_id": paper_id,
+                        "found": False,
+                        "error": paper["error"]
+                    }
+                    
+                logger.info(f"[TOOL] Successfully retrieved paper by ID: '{paper.get('title')}'")
+                return await agent._generate_paper_response(paper, paper_id, session)
+            else:
+                # Check if this might be a book or non-arXiv publication
+                if "introduction" in paper_id.lower() or "book" in paper_id.lower():
+                    return {
+                        "type": "paper_detail",
+                        "paper_id": paper_id,
+                        "found": False,
+                        "error": "This appears to be a book or published work, not an arXiv paper. arXiv only contains academic papers and preprints. You may want to search for this work in a library catalog or academic database."
+                    }
+                else:
+                    return {
+                        "type": "paper_detail",
+                        "paper_id": paper_id,
+                        "found": False,
+                        "error": "Could not find this paper on arXiv. This could be because:\n1. It's not an arXiv paper (e.g., it's a published book or article)\n2. The title might be slightly different\n3. It might be in a different repository\n\nTry searching for academic papers on this topic instead."
+                    }
             
         except Exception as e:
             logger.error(f"[TOOL] Error fetching paper {paper_id}: {str(e)}")
@@ -490,26 +654,329 @@ class Tools:
                 "found": False,
                 "error": str(e)
             }
-    
+
     @staticmethod
     async def get_agent_info(query: str, session: Session, agent: 'ArxivResearchAgent') -> Dict[str, Any]:
-        """Return information about the agent itself."""
+        """Return information about the agent itself or session history."""
         logger.info(f"[TOOL] get_agent_info called with query: '{query}'")
         
+        # Check if query is about session history or agent capabilities
+        is_history_query = any(term in query.lower() for term in [
+            "recent", "history", "last", "previous", "we discussed", "talked about", 
+            "researched", "searched", "looked up"
+        ])
+        
+        if is_history_query and hasattr(session, "metadata"):
+            # Construct session history summary
+            history_data = []
+            
+            if "last_action" in session.metadata:
+                history_data.append(f"Last action: {session.metadata['last_action']}")
+            
+            # Include search history
+            if "last_search_query" in session.metadata:
+                history_data.append(f"Last search query: {session.metadata['last_search_query']}")
+            
+            # Include paper details
+            if "current_paper" in session.metadata:
+                paper = session.metadata["current_paper"]
+                history_data.append(f"Last viewed paper: {paper.get('title', 'Unknown')}")
+            
+            # Include explanation history
+            if "last_explanation_query" in session.metadata:
+                history_data.append(f"Last discussed concept: {session.metadata['last_explanation_query']}")
+            
+            # Include author profile history
+            if "current_author" in session.metadata:
+                author = session.metadata["current_author"]
+                history_data.append(f"Last viewed author: {author.get('name', 'Unknown')}")
+            
+            # Include recent papers
+            if "last_papers" in session.metadata:
+                papers = session.metadata["last_papers"]
+                if papers:
+                    paper_titles = [p.get('title', 'Unknown') for p in papers[:3]]
+                    history_data.append(f"Recent papers: {', '.join(paper_titles)}")
+            
+            # Create history prompt
+            task_instructions = """
+            Summarize the user's session history conversationally.
+            Be helpful and informative.
+            Suggest next steps based on their history.
+            """
+            
+            # If we have history data, create a detailed prompt
+            if history_data:
+                user_prompt = f"""
+                Query about session history: "{query}"
+                
+                Session History:
+                {chr(10).join(f"- {item}" for item in history_data)}
+                
+                Provide:
+                1. A summary of what the user has explored so far
+                2. Suggestions for next steps (e.g., exploring a paper in more detail, related topics)
+                3. A conversational response to their history query
+                """
+            else:
+                # No history data available
+                user_prompt = f"""
+                Query about session history: "{query}"
+                
+                No significant session history is available yet. The user hasn't performed any searches or viewed any papers.
+                
+                Provide:
+                1. A brief explanation that there's no significant history yet
+                2. Suggestions for how they could start exploring research on arXiv
+                3. A conversational response to their query
+                """
+            
+            summary = await agent._model_provider.query(user_prompt, task_instructions)
+            filtered_summary = agent._filter_inappropriate_content(summary)
+            
+            return {
+                "type": "agent_info",
+                "query": query,
+                "summary": filtered_summary,
+                "is_history_query": True
+            }
+        else:
+            # Standard agent capabilities info
+            task_instructions = """
+            Explain the agent's capabilities conversationally, encouraging exploration.
+            List capabilities clearly with examples.
+            """
+            
+            user_prompt = f"""
+            Query: {query}
+            Agent Name: {agent.name}
+            Description: An arXiv Research Agent for academic discussions and research assistance.
+            Capabilities:
+            - Discuss academic concepts and trends
+            - Search for papers by topic
+            - Summarize specific papers
+            - Profile authors' research
+            - Answer questions about capabilities
+            - Track your research session history
+            
+            Provide:
+            1. Query acknowledgment
+            2. Capabilities list (numbered)
+            3. Example queries (e.g., "What is AI?", "Find papers on quantum computing")
+            """
+            
+            summary = await agent._model_provider.query(user_prompt, task_instructions)
+            filtered_summary = agent._filter_inappropriate_content(summary)
+            
+            return {
+                "type": "agent_info",
+                "query": query,
+                "summary": filtered_summary,
+                "is_history_query": False
+            }
+    
+    @staticmethod
+    async def explain_concept(
+        query: str,
+        session: Session,
+        agent: 'ArxivResearchAgent'
+    ) -> Dict[str, Any]:
+        """
+        Handle open-ended discussions and explanations of academic concepts.
+        
+        Args:
+            query: The question or concept to explain
+            session: Session information
+            agent: The ArxivResearchAgent instance
+            
+        Returns:
+            Dictionary with explanation and optional related papers
+        """
+        logger.info(f"[TOOL] explain_concept called with query: '{query}'")
+        
+        # Get the explanation from the query classification if available
+        query_classification = session.metadata.get('last_classification', {})
+        classification_explanation = query_classification.get('explanation', '')
+        
+        if classification_explanation:
+            logger.info(f"[TOOL] Classification explanation: '{classification_explanation}'")
+        
+        # First, transform the user query into better search terms using the LLM
+        # Pass the classification explanation to the transform method
+        search_terms = await agent._transform_query_to_search_terms(
+            query=query,
+            classification_explanation=classification_explanation
+        )
+        logger.info(f"[TOOL] Transformed query '{query}' into search terms: '{search_terms}'")
+        
+        task_instructions = """
+        Engage in academic discussions about concepts, providing clear explanations.
+        Only reference papers provided in the prompt, which are sourced from arXiv.
+        If no arXiv papers are available, state this explicitly and avoid citing other sources.
+        When referencing papers, use the exact titles provided in the prompt.
+        Do not list the papers at the end of your response - they will be added automatically.
+        Encourage further conversation or refinement.
+        """
+        
+        user_prompt = f"""
+        Query: {query}
+        
+        Provide:
+        1. Concise explanation of the concept or topic (100-200 words)
+        2. Key aspects, applications, or trends
+        3. Connection to recent arXiv research (if papers are provided)
+        4. Invitation to discuss further or refine the topic
+        
+        Important: 
+        - Only reference papers that are explicitly provided in the prompt.
+        - If no papers are provided, do not cite any specific papers in your response.
+        - Do not list the papers at the end of your response - they will be added automatically.
+        - Focus on integrating paper references naturally into your explanation.
+        - Avoid redundant paper listings - papers will be shown separately.
+        """
+        
+        # Always search for related papers to ensure we have arXiv sources
+        search_results = []
+        try:
+            # Determine sort method based on the transformed query
+            sort_method = "relevance"
+            
+            # If the transformed query includes a date constraint, use date-based sorting
+            if "submittedDate" in search_terms:
+                sort_method = "lastUpdatedDate"
+                logger.info(f"[TOOL] Using date-based sorting due to date constraint in transformed query")
+            
+            logger.info(f"[TOOL] Final search terms: '{search_terms}'")
+            logger.info(f"[TOOL] Using sort method: '{sort_method}'")
+            
+            # Try the transformed search terms first
+            search_results = await agent._arxiv_provider.search(
+                query=search_terms,  # Use transformed search terms instead of raw query
+                max_results=5,  # Increased from 3 to 5
+                sort_by=sort_method
+            )
+            
+            # If we got very few results, try a less restrictive search
+            if len(search_results) < 2:
+                logger.info("[TOOL] Few results found, trying less restrictive search")
+                
+                # Make search less restrictive - remove exact phrase requirements and some constraints
+                less_restrictive_terms = search_terms
+                
+                # Replace exact phrase matching with regular term matching
+                less_restrictive_terms = less_restrictive_terms.replace('ti:"', 'ti:')
+                less_restrictive_terms = less_restrictive_terms.replace('abs:"', 'abs:')
+                less_restrictive_terms = less_restrictive_terms.replace('"', ' ')
+                
+                # Remove some AND constraints if there are multiple
+                if less_restrictive_terms.count("AND") > 1:
+                    # Keep only the most important parts - category and date if present
+                    parts = []
+                    for part in less_restrictive_terms.split(" AND "):
+                        if "cat:" in part or "submittedDate" in part or "(" not in part:
+                            parts.append(part)
+                    
+                    # Ensure we have at least one non-date, non-category constraint
+                    if not any(p for p in parts if "cat:" not in p and "submittedDate" not in p):
+                        # Find the first meaningful part
+                        for part in less_restrictive_terms.split(" AND "):
+                            if "cat:" not in part and "submittedDate" not in part:
+                                parts.append(part)
+                                break
+                    
+                    less_restrictive_terms = " AND ".join(parts)
+                
+                logger.info(f"[TOOL] Trying less restrictive search: '{less_restrictive_terms}'")
+                
+                less_restrictive_results = await agent._arxiv_provider.search(
+                    query=less_restrictive_terms,
+                    max_results=5,
+                    sort_by=sort_method
+                )
+                
+                if len(less_restrictive_results) > len(search_results):
+                    search_results = less_restrictive_results
+                    logger.info(f"[TOOL] Found {len(search_results)} papers with less restrictive search")
+            
+            # Add paper information to the prompt if we found relevant papers
+            if search_results:
+                papers_text = "\n".join([
+                    f"Title: {paper['title']}\nAuthors: {', '.join(paper['authors'])}\nPublished: {paper['published']}\nSummary: {paper['summary'][:150]}..."
+                    for paper in search_results
+                ])
+                user_prompt += f"\nRelated Papers from arXiv:\n{papers_text}"
+                logger.info(f"[TOOL] Added {len(search_results)} related papers to the prompt")
+            else:
+                # If still no papers, use a fallback approach with basic terms
+                logger.info("[TOOL] No papers found, trying fallback search with basic terms")
+                
+                # Extract core concepts from the query
+                core_concepts = []
+                for word in query.lower().split():
+                    if len(word) > 3 and word not in ["what", "where", "when", "which", "find", "tell", "show", "give", "list", "most", "recent", "latest", "current"]:
+                        core_concepts.append(word)
+                
+                # Use only the most important keywords
+                if len(core_concepts) >= 2:
+                    fallback_query = " ".join(core_concepts[:3])  # Use top 3 keywords with OR logic
+                    logger.info(f"[TOOL] Trying fallback search with: '{fallback_query}'")
+                    
+                    fallback_results = await agent._arxiv_provider.search(
+                        query=fallback_query,
+                        max_results=5,
+                        sort_by=sort_method
+                    )
+                    
+                    if fallback_results:
+                        search_results = fallback_results
+                        papers_text = "\n".join([
+                            f"Title: {paper['title']}\nAuthors: {', '.join(paper['authors'])}\nPublished: {paper['published']}\nSummary: {paper['summary'][:150]}..."
+                            for paper in search_results
+                        ])
+                        user_prompt += f"\nRelated Papers from arXiv:\n{papers_text}"
+                        logger.info(f"[TOOL] Added {len(search_results)} papers from fallback search")
+                    else:
+                        user_prompt += "\nNo relevant arXiv papers found for this query."
+                        logger.info("[TOOL] No relevant papers found with fallback search")
+                else:
+                    user_prompt += "\nNo relevant arXiv papers found for this query."
+                    logger.info("[TOOL] No relevant papers found for the query")
+        except Exception as e:
+            logger.error(f"[TOOL] Error searching for related papers: {str(e)}")
+            user_prompt += "\nUnable to retrieve arXiv papers due to an error."
+        
+        # Generate explanation
+        explanation = await agent._model_provider.query(user_prompt, task_instructions)
+        filtered_explanation = agent._filter_inappropriate_content(explanation)
+        
+        # Validate references in explanation
+        if search_results:
+            # Check if any paper titles from search_results are referenced
+            paper_titles = [paper['title'] for paper in search_results]
+            referenced_papers = [title for title in paper_titles if title in filtered_explanation]
+            
+            if not referenced_papers:
+                filtered_explanation += "\n\nNote: This explanation is based on general knowledge. While I found some relevant arXiv papers, I've chosen to provide a general explanation without specific paper references. You can ask me to discuss any of the found papers in detail."
+            else:
+                filtered_explanation += "\n\nNote: All referenced papers are from arXiv."
+        else:
+            filtered_explanation += "\n\nNote: This explanation is based on general knowledge. No relevant arXiv papers were found for this query. For arXiv-specific research, please refine your query."
+        
+        # Store related papers in session if we found any
+        if search_results:
+            await agent._manage_session_state(
+                session,
+                "explanation",
+                {
+                    "query": query,
+                    "related_papers": search_results
+                }
+            )
+        
         return {
-            "type": "agent_info",
             "query": query,
-            "name": agent.name,
-            "description": "I am an arXiv Research Agent that can help you find and understand scientific papers. "
-                        "I can search for papers on specific topics, provide details about individual papers, "
-                        "and generate summaries of research findings.",
-            "capabilities": [
-                "Search for papers on arXiv by topic",
-                "Retrieve details about specific papers by ID",
-                "Find papers by specific authors",
-                "Generate summaries of research findings",
-                "Provide academic context for search results"
-            ]
+            "explanation": filtered_explanation,
+            "related_papers": search_results
         }
 
 
@@ -532,7 +999,7 @@ class ArxivResearchAgent(AbstractAgent):
             raise ValueError("MODEL_API_KEY is not set")
         
         model_base_url = os.getenv("MODEL_BASE_URL", "https://api.fireworks.ai/inference/v1")
-        model_name = os.getenv("MODEL_NAME", "accounts/fireworks/models/llama-v3-70b-instruct")
+        model_name = os.getenv("MODEL_NAME", "accounts/fireworks/models/llama-v3p3-70b-instruct")
         
         logger.info(f"[INIT] Using model: {model_name} from {model_base_url}")
         
@@ -611,6 +1078,18 @@ class ArxivResearchAgent(AbstractAgent):
                 if 'profile' in data:
                     session.metadata['current_author'] = data['profile']
                 session.metadata['last_action'] = 'author_profile'
+        elif action == "explanation":
+            if data and 'query' in data:
+                session.metadata['last_explanation_query'] = data['query']
+                session.metadata['last_explanation_time'] = datetime.now().isoformat()
+                if 'related_papers' in data and data['related_papers']:
+                    session.metadata['last_papers'] = data['related_papers']
+                session.metadata['last_action'] = 'explanation'
+        elif action == "update":
+            if data:
+                for key, value in data.items():
+                    session.metadata[key] = value
+                    logger.info(f"[SESSION] Updated {key} in session metadata")
         
         # Update session in persistent store
         await self._update_session(session)
@@ -706,11 +1185,19 @@ class ArxivResearchAgent(AbstractAgent):
             
             # Now proceed with query classification and handling
             query_type, query_data = await self._classify_query(query.prompt, session)
+            logger.info(f"[ASSIST] Query classified as {query_type.value} with data: {query_data}")
             
-            # Handle the query based on its type
-            if query_type == QueryType.SEARCH:
+            # Store the classification results in session for context in other methods
+            session.metadata['last_classification'] = query_data
+            
+            # Get the tool name to use
+            tool_name = query_data.get("tool", "none")
+            logger.info(f"[ASSIST] Selected tool: {tool_name}")
+            
+            # Handle the query based on tool name
+            if tool_name == "search_papers":
                 result = await Tools.search_papers(
-                    query=query_data.get('search_term', query.prompt),  # Use extracted search_term with fallback
+                    query=query_data.get('query', query.prompt),  # Use extracted query with fallback
                     session=session,
                     agent=self,
                     author=query_data.get('author'),
@@ -721,14 +1208,27 @@ class ArxivResearchAgent(AbstractAgent):
                 )
                 await self._handle_search_response(result, response_handler, session)
                 
-            elif query_type == QueryType.PAPER_DETAIL:
+            elif tool_name == "get_paper_details":
                 paper_id = query_data.get('paper_id')
                 paper_title = query_data.get('paper_title')
+                
+                # Also check for 'title' since the LLM sometimes uses this parameter name
+                if not paper_title and 'title' in query_data:
+                    paper_title = query_data.get('title')
+                    logger.info(f"[ASSIST] Found title parameter instead of paper_title: '{paper_title}'")
                 
                 # If we have a paper title but no paper ID, use the title
                 if not paper_id and paper_title:
                     paper_id = paper_title
                     logger.info(f"[ASSIST] Using paper title for search: '{paper_id}'")
+                
+                # If we still don't have a paper_id, try to extract it from the query directly
+                if not paper_id and '"' in query.prompt:
+                    # Try to extract title from quotes in the query
+                    match = re.search(r'"([^"]+)"', query.prompt)
+                    if match:
+                        paper_id = match.group(1)
+                        logger.info(f"[ASSIST] Extracted paper title from quotes: '{paper_id}'")
                 
                 if not paper_id:
                     await self._handle_error_response(
@@ -740,7 +1240,7 @@ class ArxivResearchAgent(AbstractAgent):
                 result = await Tools.get_paper_details(paper_id, session, self)
                 await self._handle_paper_detail_response(result, response_handler, session)
                 
-            elif query_type == QueryType.AUTHOR_PROFILE:
+            elif tool_name == "get_author_profile":
                 author_name = query_data.get('author')
                 if not author_name:
                     await self._handle_error_response(
@@ -751,6 +1251,18 @@ class ArxivResearchAgent(AbstractAgent):
                 
                 result = await Tools.get_author_profile(author_name, session, self)
                 await self._handle_author_profile_response(result, response_handler, session)
+                
+            elif tool_name == "explain_concept":
+                result = await Tools.explain_concept(
+                    query_data.get('query', query.prompt),
+                    session,
+                    self
+                )
+                await self._handle_explanation_response(result, response_handler, session)
+                
+            elif tool_name == "get_agent_info":
+                result = await Tools.get_agent_info(query.prompt, session, self)
+                await self._handle_agent_info_response(result, response_handler)
                 
             elif query_type == QueryType.FOLLOWUP:
                 if not session.metadata.get('last_papers'):
@@ -766,10 +1278,6 @@ class ArxivResearchAgent(AbstractAgent):
                     response_handler,
                     session
                 )
-                
-            elif query_type == QueryType.AGENT_INFO:
-                result = await Tools.get_agent_info(query.prompt, session, self)
-                await self._handle_agent_info_response(result, response_handler)
                 
             elif query_type == QueryType.GREETING:
                 await self._handle_greeting_response(query.prompt, response_handler)
@@ -797,38 +1305,29 @@ class ArxivResearchAgent(AbstractAgent):
                 
                 # Use LLM to generate a more helpful response
                 try:
-                    prompt = f"""
-                    The user's query couldn't be classified: "{query.prompt}"
+                    task_instructions = """
+                    Provide helpful guidance when queries are unclear.
+                    Suggest potential intents and ways to rephrase for better results.
+                    """
+                    
+                    user_prompt = f"""
+                    The user's query was unclear: "{query.prompt}"
                     
                     Conversation context:
                     {context}
                     
                     Generate a helpful response that:
                     1. Acknowledges the query was unclear
-                    2. Analyzes the query to identify potential intent
-                    3. Provides specific suggestions based on the context
+                    2. Analyzes the possible intent
+                    3. Provides specific suggestions
                     4. Gives clear examples of how to rephrase
                     5. Keeps the response concise (2-3 sentences)
                     6. Uses formal academic language
                     7. Maintains a helpful and encouraging tone
-                    
-                    Remember:
-                    - I am an arXiv research assistant that can help search for papers, analyze research, and provide detailed summaries
-                    - The response should guide the user to rephrase their query in a way I can help with
-                    - Use the conversation context to make relevant suggestions
-                    - Be specific about what kind of information would help clarify their request
                     """
                     
-                    system_prompt = (
-                        "You are a professional academic research assistant. "
-                        "Your responses are helpful, specific, and encouraging. "
-                        "You analyze queries carefully to provide relevant guidance. "
-                        "You maintain a scholarly tone while being supportive and helpful. "
-                        "You help users rephrase their queries to get the academic assistance they need."
-                    )
-                    
                     logger.info("[RESPONSE] Generating unknown query response with LLM")
-                    response = await self._model_provider.query(prompt, system_prompt)
+                    response = await self._model_provider.query(user_prompt, task_instructions)
                     
                     await final_response_stream.emit_chunk(response)
                     
@@ -843,7 +1342,7 @@ class ArxivResearchAgent(AbstractAgent):
                         Keep it under 2 sentences and maintain a professional tone.
                         """
                         
-                        fallback_response = await self._model_provider.query(fallback_prompt, system_prompt)
+                        fallback_response = await self._model_provider.query(fallback_prompt, "")
                         await final_response_stream.emit_chunk(fallback_response)
                     except Exception as e2:
                         logger.error(f"[RESPONSE] Error generating fallback response: {str(e2)}")
@@ -851,12 +1350,6 @@ class ArxivResearchAgent(AbstractAgent):
                         await final_response_stream.emit_chunk("I need more specific details to help you. Could you please rephrase your question?")
                 
                 await final_response_stream.complete()
-                
-                # Update session state
-                await self._update_session(session)
-                
-                # Mark response as complete
-                await response_handler.complete()
             
             # Update session state
             await self._update_session(session)
@@ -885,8 +1378,6 @@ class ArxivResearchAgent(AbstractAgent):
             else:
                 logger.info(f"[SESSION] - {key}: {value}")
 
-                
-    
     async def _classify_query(
             self,
             query_text: str,
@@ -939,38 +1430,6 @@ class ArxivResearchAgent(AbstractAgent):
         """
         logger.info(f"[CLASSIFY] Classifying query with LLM: '{query_text}'")
         
-        # First check if the query contains a paper ID pattern
-        paper_id_pattern = r'\b\d{4}\.\d{5}\b'  # Matches patterns like 1910.05546
-        paper_id_match = re.search(paper_id_pattern, query_text)
-        
-        if paper_id_match:
-            paper_id = paper_id_match.group(0)
-            logger.info(f"[CLASSIFY] Found paper ID in query: {paper_id}")
-            return QueryType.PAPER_DETAIL, {
-                "paper_id": paper_id,
-                "paper_title": "",
-                "author": "",
-                "list_all_papers": False,
-                "category": ""
-            }
-        
-        # Check for numerical paper reference
-        paper_number_pattern = r'paper\s+(?:number\s+)?#?(\d+)'
-        paper_number_match = re.search(paper_number_pattern, query_text.lower())
-        if paper_number_match and "last_papers" in session.metadata:
-            paper_number = int(paper_number_match.group(1)) - 1  # Convert to 0-based index
-            papers = session.metadata["last_papers"]
-            if 0 <= paper_number < len(papers):
-                paper = papers[paper_number]
-                paper_id = self._extract_paper_id(paper)
-                if paper_id:
-                    logger.info(f"[CLASSIFY] Found paper by number {paper_number + 1}: {paper_id}")
-                    return QueryType.PAPER_DETAIL, {
-                        "paper_id": paper_id,
-                        "paper_title": paper.get("title", ""),
-                        "paper_number": paper_number + 1
-                    }
-        
         # Build context from session
         context = "No previous conversation context."
         if hasattr(session, "metadata"):
@@ -981,420 +1440,129 @@ class ArxivResearchAgent(AbstractAgent):
                     papers = session.metadata["last_papers"]
                     paper_titles = [p.get('title', 'Unknown') for p in papers[:3]]
                     context += f"\nThe last search returned these papers: {', '.join(paper_titles)}"
-                    if "last_query" in session.metadata:
-                        context += f"\nThe search query was: {session.metadata['last_query']}"
+                    if "last_search_query" in session.metadata:
+                        context += f"\nThe search query was: {session.metadata['last_search_query']}"
                         
                 elif session.metadata["last_action"] == "paper_detail" and "current_paper" in session.metadata:
                     paper = session.metadata["current_paper"]
                     context += f"\nThe current paper being discussed is: {paper.get('title', 'Unknown')}"
+                    
+                elif session.metadata["last_action"] == "author_profile" and "current_author" in session.metadata:
+                    author = session.metadata["current_author"]
+                    context += f"\nThe current author being discussed is: {author.get('name', 'Unknown')}"
+                    
+                elif session.metadata["last_action"] == "explanation" and "last_explanation_query" in session.metadata:
+                    query = session.metadata["last_explanation_query"]
+                    context += f"\nThe last concept discussed was: {query}"
         
-        # Create prompt for classification
-        system_prompt = """You are a query analyzer for an arXiv research assistant. Classify the user's query type and extract entities.
-
-Query types:
-- SEARCH: User wants to search for papers on a topic
-- PAPER_DETAIL: User wants details about a specific paper
-- AUTHOR_PROFILE: User wants information about an author's work and background
-- FOLLOWUP: User is asking a follow-up about previous results
-- AGENT_INFO: User is asking about the agent itself
-- GREETING: A simple greeting
-- UNKNOWN: Cannot classify
-
-arXiv Categories:
-- Computer Science:
-  - cs.AI: Artificial Intelligence
-  - cs.AR: Hardware Architecture
-  - cs.CC: Computational Complexity
-  - cs.CE: Computational Engineering, Finance, and Science
-  - cs.CG: Computational Geometry
-  - cs.CL: Computation and Language
-  - cs.CR: Cryptography and Security
-  - cs.CV: Computer Vision and Pattern Recognition
-  - cs.CY: Computers and Society
-  - cs.DB: Databases
-  - cs.DC: Distributed, Parallel, and Cluster Computing
-  - cs.DL: Digital Libraries
-  - cs.DM: Discrete Mathematics
-  - cs.DS: Data Structures and Algorithms
-  - cs.ET: Emerging Technologies
-  - cs.FL: Formal Languages and Automata Theory
-  - cs.GL: General Literature
-  - cs.GR: Graphics
-  - cs.GT: Game Theory
-  - cs.HC: Human-Computer Interaction
-  - cs.IR: Information Retrieval
-  - cs.IT: Information Theory
-  - cs.LG: Machine Learning
-  - cs.LO: Logic in Computer Science
-  - cs.MA: Multiagent Systems
-  - cs.MM: Multimedia
-  - cs.MS: Mathematical Software
-  - cs.NA: Numerical Analysis
-  - cs.NE: Neural and Evolutionary Computing
-  - cs.NI: Networking and Internet Architecture
-  - cs.OH: Other Computer Science
-  - cs.OS: Operating Systems
-  - cs.PF: Performance
-  - cs.PL: Programming Languages
-  - cs.RO: Robotics
-  - cs.SC: Symbolic Computation
-  - cs.SD: Sound
-  - cs.SE: Software Engineering
-  - cs.SI: Social and Information Networks
-  - cs.SY: Systems and Control
-
-- Mathematics:
-  - math.AG: Algebraic Geometry
-  - math.AT: Algebraic Topology
-  - math.AP: Analysis of PDEs
-  - math.CT: Category Theory
-  - math.CA: Classical Analysis and ODEs
-  - math.CO: Combinatorics
-  - math.AC: Commutative Algebra
-  - math.CV: Complex Variables
-  - math.DG: Differential Geometry
-  - math.DS: Dynamical Systems
-  - math.FA: Functional Analysis
-  - math.GM: General Mathematics
-  - math.GN: General Topology
-  - math.GT: Geometric Topology
-  - math.GR: Group Theory
-  - math.HO: History and Overview
-  - math.IT: Information Theory
-  - math.KT: K-Theory and Homology
-  - math.LO: Logic
-  - math.MG: Metric Geometry
-  - math.MP: Mathematical Physics
-  - math.NA: Numerical Analysis
-  - math.NT: Number Theory
-  - math.OA: Operator Algebras
-  - math.OC: Optimization and Control
-  - math.PR: Probability
-  - math.QA: Quantum Algebra
-  - math.RA: Rings and Algebras
-  - math.RT: Representation Theory
-  - math.SG: Symplectic Geometry
-  - math.SP: Spectral Theory
-  - math.ST: Statistics
-
-- Physics:
-  - physics.acc-ph: Accelerator Physics
-  - physics.ao-ph: Atmospheric and Oceanic Physics
-  - physics.atom-ph: Atomic Physics
-  - physics.atm-clus: Atomic and Molecular Clusters
-  - physics.bio-ph: Biological Physics
-  - physics.chem-ph: Chemical Physics
-  - physics.class-ph: Classical Physics
-  - physics.comp-ph: Computational Physics
-  - physics.data-an: Data Analysis, Statistics and Probability
-  - physics.flu-dyn: Fluid Dynamics
-  - physics.gen-ph: General Physics
-  - physics.geo-ph: Geophysics
-  - physics.hist-ph: History of Physics
-  - physics.ins-det: Instrumentation and Detectors
-  - physics.med-ph: Medical Physics
-  - physics.optics: Optics
-  - physics.ed-ph: Physics Education
-  - physics.soc-ph: Physics and Society
-  - physics.plasm-ph: Plasma Physics
-  - physics.pop-ph: Popular Physics
-  - physics.space-ph: Space Physics
-
-- Quantitative Finance:
-  - q-fin.CP: Computational Finance
-  - q-fin.EC: Economics
-  - q-fin.GN: General Finance
-  - q-fin.MF: Mathematical Finance
-  - q-fin.PM: Portfolio Management
-  - q-fin.PR: Pricing of Securities
-  - q-fin.RM: Risk Management
-  - q-fin.ST: Statistical Finance
-  - q-fin.TR: Trading and Market Microstructure
-
-- Statistics:
-  - stat.AP: Applications
-  - stat.CO: Computation
-  - stat.ML: Machine Learning
-  - stat.ME: Methodology
-  - stat.OT: Other Statistics
-  - stat.TH: Theory
-
-- Economics:
-  - econ.EM: Econometrics
-  - econ.GN: General Economics
-  - econ.TH: Theoretical Economics
-
-- Quantitative Biology:
-  - q-bio.BM: Biomolecules
-  - q-bio.CB: Cell Behavior
-  - q-bio.GN: Genomics
-  - q-bio.MN: Molecular Networks
-  - q-bio.NC: Neurons and Cognition
-  - q-bio.OT: Other Quantitative Biology
-  - q-bio.PE: Populations and Evolution
-  - q-bio.QM: Quantitative Methods
-  - q-bio.SC: Subcellular Processes
-  - q-bio.TO: Tissues and Organs
-
-- Nonlinear Sciences:
-  - nlin.AO: Adaptation and Self-Organizing Systems
-  - nlin.CD: Chaotic Dynamics
-  - nlin.CG: Cellular Automata and Lattice Gases
-  - nlin.PS: Pattern Formation and Solitons
-  - nlin.SI: Exactly Solvable and Integrable Systems
-
-- Electrical Engineering and Systems Science:
-  - eess.AS: Audio and Speech Processing
-  - eess.IV: Image and Video Processing
-  - eess.SP: Signal Processing
-  - eess.SY: Systems and Control
-
-- Astrophysics:
-  - astro-ph.CO: Cosmology and Nongalactic Astrophysics
-  - astro-ph.EP: Earth and Planetary Astrophysics
-  - astro-ph.GA: Astrophysics of Galaxies
-  - astro-ph.HE: High Energy Astrophysical Phenomena
-  - astro-ph.IM: Instrumentation and Methods for Astrophysics
-  - astro-ph.SR: Solar and Stellar Astrophysics
-
-- Condensed Matter:
-  - cond-mat.dis-nn: Disordered Systems and Neural Networks
-  - cond-mat.mes-hall: Mesoscopic Systems and Quantum Hall Effect
-  - cond-mat.mtrl-sci: Materials Science
-  - cond-mat.other: Other Condensed Matter
-  - cond-mat.quant-gas: Quantum Gases
-  - cond-mat.soft: Soft Condensed Matter
-  - cond-mat.stat-mech: Statistical Mechanics
-  - cond-mat.str-el: Strongly Correlated Electrons
-  - cond-mat.supr-con: Superconductivity
-
-- General Relativity and Quantum Cosmology:
-  - gr-qc: General Relativity and Quantum Cosmology
-
-- High Energy Physics:
-  - hep-ex: High Energy Physics - Experiment
-  - hep-lat: High Energy Physics - Lattice
-  - hep-ph: High Energy Physics - Phenomenology
-  - hep-th: High Energy Physics - Theory
-
-- Mathematical Physics:
-  - math-ph: Mathematical Physics
-
-- Nuclear Experiment:
-  - nucl-ex: Nuclear Experiment
-
-- Nuclear Theory:
-  - nucl-th: Nuclear Theory
-
-- Quantum Physics:
-  - quant-ph: Quantum Physics
-
-Output JSON format:
-{
-  "query_type": "TYPE",
-  "entities": {
-    "search_term": "extracted search term",
-    "enhanced_search_term": "ONLY the formatted arXiv search query without any explanation or additional text (e.g., '(ti:\"technical term\" OR abs:\"technical term\" OR ti:acronym OR abs:acronym OR ti:related OR abs:related)')",
-    "paper_id": "extracted paper ID",
-    "paper_title": "extracted paper title",
-    "author": "extracted author name",
-    "topic": "extracted topic/category",
-    "date_range": "extracted date range",
-    "sort_by": "how to sort (relevance, submittedDate, lastUpdatedDate)",
-    "list_all_papers": true/false,
-    "category": "proper arXiv category code if topic matches a category"
-  }
-}
-
-IMPORTANT: Before generating the enhanced_search_term, first understand and expand the query:
-1. Identify any technical terms, acronyms, or domain-specific language
-2. Expand acronyms to their full forms (e.g., NLP -> Natural Language Processing, CNN -> Convolutional Neural Network)
-3. Understand the relationships between terms (e.g., how different concepts relate to each other)
-4. Consider common variations and synonyms in the field
-5. Think about what researchers might actually use in paper titles and abstracts
-
-Example query understanding:
-Input: "NLP transformer models"
-Understanding:
-- NLP = Natural Language Processing
-- Transformer is a specific type of neural network architecture
-- This is about transformer-based models in natural language processing
-- Related terms might include: attention mechanisms, language models, deep learning
-- Researchers might use variations like: "transformer architecture", "transformer-based", "neural language models"
-
-Only after this understanding, generate the enhanced_search_term that includes:
-1. The original terms as phrases
-2. Expanded forms of acronyms
-3. Related technical terms
-4. Common variations used in research papers
-
-Example enhanced_search_term for "NLP transformer models":
-"(ti:\"Natural Language Processing\" OR abs:\"Natural Language Processing\" OR ti:\"NLP transformer\" OR abs:\"NLP transformer\" OR ti:\"transformer architecture\" OR abs:\"transformer architecture\" OR ti:\"language models\" OR abs:\"language models\")"
-
-IMPORTANT FORMATTING RULES FOR enhanced_search_term:
-1. Return ONLY the formatted query, no explanations or additional text
-2. Use ti: prefix for title searches and abs: prefix for abstract searches
-3. Put phrases in quotes (e.g., ti:\"technical term\")
-4. Use OR between terms
-5. Put the entire search in parentheses
-6. Include both title and abstract searches for each term
-7. Keep the query concise but comprehensive
-8. Use proper arXiv search syntax
-9. For technical terms and acronyms, keep them together as phrases when they appear in sequence
-10. For terms that might be acronyms (e.g., DSA, SOTA), search for both the acronym and potential expansions
-11. When terms appear together in the query, keep them together in the search (e.g., \"DSA SOTA\" should be searched as a phrase)
-
-DO NOT include:
-- Explanations of the query
-- Reasoning about the terms
-- Additional text before or after the query
-- Any text that isn't part of the actual search query
-
-CRITICAL CLASSIFICATION RULES:
-1. If the query contains a paper title from previous results, ALWAYS classify as PAPER_DETAIL or FOLLOWUP, NOT SEARCH.
-2. If the query contains phrases like "dive into", "tell me more about", "explain", "analyze", "break down" followed by a paper title or reference to a specific paper, classify as PAPER_DETAIL.
-3. If the query contains phrases like "dive into", "explore", "research about", "find papers about", "search for", "look for" followed by a general topic or research area, classify as SEARCH.
-4. If the query contains phrases like "this paper", "the paper", "that paper", "first paper" and we have previous results, classify as FOLLOWUP.
-5. If the query explicitly asks about an author (e.g., "tell me about author X", "show me papers by X", "who is X") classify as AUTHOR_PROFILE.
-6. For PAPER_DETAIL, try to match the paper title with previous results and include the paper_id in entities.
-7. If the query contains a paper number reference (e.g., "paper number 3", "paper #2"), classify as PAPER_DETAIL and include the paper_id from the corresponding paper in last_papers.
-8. If unsure about the classification, prefer UNKNOWN over incorrect classification.
-9. For SEARCH queries, classify as SEARCH if:
-   - It's clearly a new search request
-   - It uses search-related verbs (find, search, look for)
-   - It's about exploring a general topic or research area
-   - It doesn't reference a specific paper or previous results
-10. When in doubt between SEARCH and PAPER_DETAIL/FOLLOWUP:
-    - If it references a specific paper or previous results, prefer PAPER_DETAIL/FOLLOWUP
-    - If it's about exploring a general topic, prefer SEARCH
-    - If truly ambiguous, prefer UNKNOWN
-11. For SEARCH queries, if the search_term and topic/category would be the same, ONLY use the search_term and DO NOT set the topic/category to avoid redundant filtering.
-12. When extracting topics/categories, try to match them with the provided arXiv category codes. If a match is found, include the proper category code in the "category" field.
-
-IMPORTANT:
-- Be extremely careful with classification - it's better to classify as UNKNOWN than to make a wrong classification
-- Always check if the query matches any paper titles from previous results
-- When classifying as PAPER_DETAIL, ensure you have a matching paper_id
-- For FOLLOWUP queries, ensure we have previous results to follow up on
-- Avoid redundant filtering by not setting both search_term and topic/category to the same value
-- Return ONLY valid JSON without any comments or explanations
-- Do not include any text before or after the JSON object
-- Ensure all JSON values are properly quoted and formatted
-- When mapping topics to categories, use the exact category codes provided
-"""
+        # Task instructions for query classification
+        task_instructions = """
+        Classify user queries to select appropriate tools or discussion modes.
+        Prioritize GENERAL_EXPLANATION for vague, discussion-oriented, or definition queries.
+        Detect multiple intents and focus on the primary one.
+        Return ONLY valid JSON, no other text.
+        Your explanation should be DETAILED and capture important signals like recency or specificity.
+        """
         
-        prompt = f"""
-        Classify this query from a user talking to an arXiv research assistant:
+        # User prompt for query classification with JSON output
+        user_prompt = f"""
+        Analyze the query: "{query_text}"
         
-        USER QUERY: {query_text}
+        Context: {context}
         
-        CONVERSATION CONTEXT:
-        {context}
+        Classify it into one of these types: SEARCH, PAPER_DETAIL, AUTHOR_PROFILE, FOLLOWUP, GENERAL_EXPLANATION, AGENT_INFO, GREETING, UNKNOWN.
+        - SEARCH: Explicit paper search (e.g., "Find papers on machine learning")
+        - PAPER_DETAIL: Specific paper details (e.g., "Summarize paper 2101.12345")
+        - AUTHOR_PROFILE: Author information (e.g., "Tell me about John Doe")
+        - FOLLOWUP: Refers to prior results (e.g., "More on paper #1")
+        - GENERAL_EXPLANATION: Concept discussion or definition (e.g., "What is AI?")
+        - AGENT_INFO: Agent capabilities or information about past activities/queries (e.g., "What can you do?", "What did we discuss last?", "What topics have I researched recently?")
+        - GREETING: Simple greetings (e.g., "Hello")
+        - UNKNOWN: Unclear queries
         
-        Based on the query and context, determine the query type and extract relevant entities.
-        Return ONLY a valid JSON object with "query_type" and "entities" fields.
+        Importantly:
+        - Queries about past discussions, recent topics, or session history should be classified as AGENT_INFO
+        - Queries containing "recent", "latest", "current", or "trending" but asking about academic topics (not user history) should be GENERAL_EXPLANATION
+        
+        Return ONLY a JSON object with these fields:
+        - type: Query type (string)
+        - tool: Tool to call (search_papers, get_author_profile, get_paper_details, explain_concept, get_agent_info, none)
+        - parameters: Tool parameters (e.g., query, author, paper_id)
+        - confidence: Score (0.0 to 1.0)
+        - explanation: Classification rationale - MUST include details like:
+          * Any recency signals ("user is asking about recent research")
+          * Any specificity signals ("user wants specific details")
+          * Any category/topic signals ("query relates to machine learning")
+          * Any time period signals ("user wants papers from last year")
+          * This explanation will be used for query transformation
+        
+        Example response:
+        {{
+            "type": "GENERAL_EXPLANATION",
+            "tool": "explain_concept",
+            "parameters": {{"query": "What is AI?"}},
+            "confidence": 0.9,
+            "explanation": "Query asks for a general explanation about what AI is, seeking a definition or overview rather than specific papers. No recency indicators present."
+        }}
+        
+        Example with recency:
+        {{
+            "type": "GENERAL_EXPLANATION",
+            "tool": "explain_concept",
+            "parameters": {{"query": "What are recent advances in quantum computing?"}},
+            "confidence": 0.9,
+            "explanation": "Query asks about recent advances in quantum computing, indicating the user wants current research or developments in this field. The recency signal 'recent advances' suggests the need for up-to-date information."
+        }}
+        
+        IMPORTANT: Return ONLY the JSON object, no other text or explanation.
         """
         
         try:
-            # Call the model for classification
-            response = await self._model_provider.query(prompt, system_prompt)
+            response = await self._model_provider.query(user_prompt, task_instructions)
             
-            # Clean the response to extract just the JSON part and remove comments
+            # Clean the response to ensure it's valid JSON
+            response = response.strip()
+            
+            # Try to find JSON in the response
             json_start = response.find('{')
             json_end = response.rfind('}') + 1
+            
             if json_start >= 0 and json_end > json_start:
                 json_str = response[json_start:json_end]
-            else:
-                json_str = response
-                
-            # Clean the JSON string by removing comments and extra whitespace
-            json_str = re.sub(r'//.*$', '', json_str, flags=re.MULTILINE)  # Remove single-line comments
-            json_str = re.sub(r'/\*.*?\*/', '', json_str, flags=re.DOTALL)  # Remove multi-line comments
-            json_str = re.sub(r'\s+', ' ', json_str).strip()  # Normalize whitespace
-            
-            # Parse the JSON response
-            try:
-                classification = json.loads(json_str)
-                
-                # Get query type
-                query_type_str = classification.get("query_type", "UNKNOWN").upper()
                 try:
-                    query_type = QueryType[query_type_str]
-                except KeyError:
-                    logger.error(f"[CLASSIFY] Invalid query type returned: {query_type_str}")
-                    query_type = QueryType.UNKNOWN
+                    result = json.loads(json_str)
                     
-                # Get entities
-                entities = classification.get("entities", {})
+                    # Get query type from result
+                    query_type_str = result.get("type", "UNKNOWN").upper()
+                    try:
+                        query_type = QueryType[query_type_str]
+                    except (KeyError, AttributeError):
+                        logger.warning(f"[CLASSIFY] Invalid query type: {query_type_str}, defaulting to UNKNOWN")
+                        query_type = QueryType.UNKNOWN
+                    
+                    # Get parameters from result
+                    entities = result.get("parameters", {})
+                    
+                    # Add other result data to entities
+                    entities["tool"] = result.get("tool", "none")
+                    entities["confidence"] = result.get("confidence", 0.0)
+                    entities["explanation"] = result.get("explanation", "Unknown reason")
+                    
+                    logger.info(f"[CLASSIFY] LLM classification result: {result}")
+                    return query_type, entities
+                except json.JSONDecodeError as je:
+                    logger.error(f"[CLASSIFY] JSON decode error: {str(je)}")
+                    logger.error(f"[CLASSIFY] Invalid JSON string: {json_str}")
+            else:
+                logger.error(f"[CLASSIFY] No JSON object found in response: {response}")
                 
-                # If we have a paper_title, try to find the matching paper in last_papers
-                if "paper_title" in entities and "last_papers" in session.metadata:
-                    paper_title = entities["paper_title"].lower()
-                    for paper in session.metadata["last_papers"]:
-                        if paper_title in paper.get("title", "").lower():
-                            entities["paper_id"] = self._extract_paper_id(paper)
-                            logger.info(f"[CLASSIFY] Found matching paper for title '{paper_title}': {entities['paper_id']}")
-                            break
-                
-                # If we have a paper_id that's not a valid arXiv ID, try to find it in last_papers
-                if "paper_id" in entities and not any(c in entities["paper_id"] for c in ["/", "."]):
-                    if "last_papers" in session.metadata:
-                        for paper in session.metadata["last_papers"]:
-                            if entities["paper_id"].lower() in paper.get("title", "").lower():
-                                entities["paper_id"] = self._extract_paper_id(paper)
-                                logger.info(f"[CLASSIFY] Found matching paper for ID '{entities['paper_id']}'")
-                                break
-                
-                # Normalize sort_by and date_range values if present
-                if "sort_by" in entities and entities["sort_by"] is not None:
-                    sort_value = entities["sort_by"].lower()
-                    if sort_value in ["relevance", "lastupdateddate", "submitteddate"]:
-                        entities["sort_by"] = sort_value
-                    else:
-                        logger.warning(f"[CLASSIFY] Invalid sort_by value: {sort_value}")
-                        del entities["sort_by"]
-                
-                if "date_range" in entities and entities["date_range"] is not None:
-                    date_value = entities["date_range"].lower()
-                    valid_ranges = ["last_day", "last_week", "last_month", "last_year"]
-                    if date_value in valid_ranges or "to" in date_value:
-                        entities["date_range"] = date_value
-                    else:
-                        logger.warning(f"[CLASSIFY] Invalid date_range value: {date_value}")
-                        del entities["date_range"]
-                
-                # Prevent redundant filtering by removing topic if it's the same as search_term
-                if "search_term" in entities and "topic" in entities:
-                    if entities["search_term"].lower() == entities["topic"].lower():
-                        logger.info(f"[CLASSIFY] Removing redundant topic filter matching search_term: {entities['topic']}")
-                        del entities["topic"]
-                
-                # Remove topic if it's identical to category to avoid redundant filtering
-                if "topic" in entities and "category" in entities:
-                    if entities["topic"].lower() == entities["category"].lower():
-                        logger.info(f"[CLASSIFY] Removing redundant topic filter matching category: {entities['topic']}")
-                        del entities["topic"]
-                
-                logger.info(f"[CLASSIFY] LLM classified as: {query_type.value}, Entities: {entities}")
-                
-                # Store the last classification for the search tool to use
-                self._last_classification = {
-                    "query_type": query_type.value,
-                    "entities": entities
-                }
-                
-                return query_type, entities
-                
-            except json.JSONDecodeError as e:
-                logger.error(f"[CLASSIFY] Failed to parse JSON from LLM: {response}")
-                logger.error(f"[CLASSIFY] JSON error: {str(e)}")
-                # Only fall back if we can't parse the JSON at all
-                return await self._classify_query_pattern_based(query_text, session)
+            # If we get here, something went wrong with JSON parsing
+            logger.warning("[CLASSIFY] Falling back to pattern-based classification")
+            return await self._classify_query_pattern_based(query_text, session)
                 
         except Exception as e:
-            logger.error(f"[CLASSIFY] Error in LLM classification: {str(e)}")
+            logger.error(f"[CLASSIFY] LLM classification failed: {str(e)}")
             logger.error(traceback.format_exc())
-            # Only fall back if there's a complete failure
             return await self._classify_query_pattern_based(query_text, session)
 
     async def _classify_query_pattern_based(self, query_text: str, session: Session) -> Tuple[QueryType, Dict[str, Any]]:
@@ -1411,44 +1579,38 @@ IMPORTANT:
         logger.info(f"[CLASSIFY] Using pattern-based classification for query: '{query_text}'")
         
         # Convert to lowercase for easier matching
-        text = query_text.lower()
-        entities = {}
+        text = query_text.lower().strip()
+        entities = {"query": query_text}
         
         # Check for greetings
         greeting_patterns = ["hello", "hi ", "hey", "greetings", "what's up"]
         for pattern in greeting_patterns:
             if text.startswith(pattern) or pattern.strip() == text:
                 logger.info("[CLASSIFY] Matched greeting pattern")
-                return QueryType.GREETING, {}
+                entities["tool"] = "none"
+                return QueryType.GREETING, entities
         
         # Check for agent info queries
         agent_info_patterns = ["who are you", "what can you do", "what are you", "help", "your capabilities"]
         if any(pattern in text for pattern in agent_info_patterns):
             logger.info(f"[CLASSIFY] Matched agent info pattern: '{next((p for p in agent_info_patterns if p in text), None)}'")
-            return QueryType.AGENT_INFO, {}
-        
-        # Check for session context - do we have previous interactions?
-        has_last_action = hasattr(session, "metadata") and "last_action" in session.metadata
-        last_action = session.metadata.get("last_action") if has_last_action else None
-        
-        logger.info(f"[CLASSIFY] Follow-up check - Has last_action: {has_last_action}, Last action: '{last_action}'")
-        
-        # Enhanced paper detail patterns
-        paper_detail_patterns = [
-            "dive into", "tell me more about", "explain", "analyze", "break down",
-            "details about", "information about", "what about", "show me",
-            "get me", "give me details", "dive deeper", "lets dive deeper",
-            "can you dive deeper", "go deeper", "this paper", "the paper",
-            "that paper", "first paper", "details", "summary", "explain",
-            "break down", "analyze", "tell me about", "what does", "how does",
-            "can i see", "look at", "examine", "review", "study", "investigate",
-            "find paper", "search for paper", "look up paper", "get paper",
-            "paper number", "paper #"  # Added patterns for numerical references
-        ]
+            entities["tool"] = "get_agent_info"
+            return QueryType.AGENT_INFO, entities
         
         # Check for paper detail patterns
+        paper_detail_patterns = [
+            "paper details", "details about paper", "tell me about paper", 
+            "summarize paper", "paper info", "paper summary", "tell me more about paper",
+            "explain paper", "analyze paper", "paper number", "paper #"
+        ]
+        
+        arxiv_id_pattern = r'(\d{4}\.\d{5})(v\d+)?'
+        arxiv_url_pattern = r'arxiv\.org\/abs\/(\d{4}\.\d{5})(v\d+)?'
+        old_arxiv_pattern = r'(\w+)\/(\d{7})(v\d+)?'  # e.g., physics/0609047
+        
+        # Check for paper detail patterns or paper IDs
         if any(pattern in text for pattern in paper_detail_patterns):
-            # Check for numerical paper reference first
+            # Check for numerical paper reference
             paper_number_match = re.search(r'paper\s+(?:number\s+)?#?(\d+)', text)
             if paper_number_match and "last_papers" in session.metadata:
                 paper_number = int(paper_number_match.group(1)) - 1  # Convert to 0-based index
@@ -1457,192 +1619,126 @@ IMPORTANT:
                     paper = papers[paper_number]
                     entities["paper_id"] = self._extract_paper_id(paper)
                     logger.info(f"[CLASSIFY] Found paper by number {paper_number + 1}: {entities['paper_id']}")
+                    entities["tool"] = "get_paper_details"
                     return QueryType.PAPER_DETAIL, entities
             
-            # Extract paper title from the query
-            paper_title = None
+            # Extract paper title if mentioned
             for pattern in paper_detail_patterns:
                 if pattern in text:
-                    # Extract text after the pattern
                     parts = text.split(pattern, 1)
                     if len(parts) > 1:
                         paper_title = parts[1].strip()
-                        # Remove any trailing quotes, parentheses, or question marks
-                        paper_title = paper_title.strip('"').strip('(').strip(')').strip('?')
-                        # Remove common trailing words
-                        for word in ["please", "thanks", "thank you", "thank", "can you", "could you"]:
-                            if paper_title.lower().endswith(word):
-                                paper_title = paper_title[:-len(word)].strip()
-                        break
-            
-            if paper_title:
-                # Try to find matching paper in last_papers if available
-                if "last_papers" in session.metadata:
-                    for paper in session.metadata["last_papers"]:
-                        if paper_title.lower() in paper.get("title", "").lower():
-                            entities["paper_id"] = self._extract_paper_id(paper)
-                            logger.info(f"[CLASSIFY] Found matching paper for title '{paper_title}': {entities['paper_id']}")
-                            return QueryType.PAPER_DETAIL, entities
-                
-                # If no match in last_papers, try to search for the paper
-                entities["paper_title"] = paper_title
-                logger.info(f"[CLASSIFY] Paper detail request for title: '{paper_title}'")
-                return QueryType.PAPER_DETAIL, entities
+                        entities["paper_title"] = paper_title
+                        entities["tool"] = "get_paper_details"
+                        logger.info(f"[CLASSIFY] Paper detail request for title: '{paper_title}'")
+                        return QueryType.PAPER_DETAIL, entities
         
-        # Check for follow-up queries
-        followup_patterns = [
-            "more details", "tell me more", "elaborate", "explain further", 
-            "what about", "show me", "get me", "give me details", "dive deeper",
-            "lets dive deeper", "can you dive deeper", "go deeper", 
-            "this paper", "the paper", "that paper", "first paper",
-            "details", "summary", "explain", "break down", "analyze", 
-            "tell me about", "what does", "how does", "can i see"
-        ]
-        
-        paper_reference_patterns = [
-            "this paper", "the paper", "that paper", "the first paper", 
-            "the top paper", "the most relevant paper"
-        ]
-        
-        # Author search patterns - NEW
-        author_search_patterns = [
-            "papers by this author", "more papers by this author", 
-            "other papers by this author", "find papers by this author",
-            "author's other papers", "more from this author", 
-            "what else has this author written", "other research by this author",
-            "same author", "other works by"
-        ]
-        
-        # Check for author search patterns if we have a current paper
-        if has_last_action and "current_paper" in session.metadata:
-            current_paper = session.metadata["current_paper"]
-            if any(pattern in text for pattern in author_search_patterns):
-                # Extract author from current paper
-                if "authors" in current_paper and current_paper["authors"]:
-                    author = current_paper["authors"][0]  # First author
-                    entities["author"] = author
-                    entities["search_term"] = ""  # Empty search term, just use author filter
-                    logger.info(f"[CLASSIFY] Detected author search for: '{author}'")
-                    return QueryType.SEARCH, entities
-        
-        # First, check for explicit paper references if we have session context
-        if has_last_action:
-            explicit_paper_reference = any(pattern in text for pattern in paper_reference_patterns)
-            if explicit_paper_reference:
-                logger.info(f"[CLASSIFY] Matched explicit paper reference: {next((p for p in paper_reference_patterns if p in text), None)}")
-                return QueryType.FOLLOWUP, {}
-            
-            # Then check for follow-up patterns
-            if any(pattern in text for pattern in followup_patterns):
-                matched_pattern = next((p for p in followup_patterns if p in text), None)
-                logger.info(f"[CLASSIFY] Matched follow-up pattern: '{matched_pattern}'")
-                return QueryType.FOLLOWUP, {}
-            
-            # Check for contextual follow-ups (short queries after previous results)
-            is_short_query = len(text.split()) <= 5
-            if is_short_query and (last_action == "search" or last_action == "paper_detail"):
-                logger.info(f"[CLASSIFY] Short query ({len(text.split())} words) with previous context detected as follow-up")
-                return QueryType.FOLLOWUP, {}
-        
-        # Check for arXiv ID patterns
-        arxiv_id_pattern = r'(\d{4}\.\d{5})(v\d+)?'
-        arxiv_url_pattern = r'arxiv\.org\/abs\/(\d{4}\.\d{5})(v\d+)?'
-        old_arxiv_pattern = r'(\w+)\/(\d{7})(v\d+)?'  # e.g., physics/0609047
-        
+        # Check for arxiv IDs directly
         arxiv_id_match = re.search(arxiv_id_pattern, query_text)
         arxiv_url_match = re.search(arxiv_url_pattern, query_text)
         old_arxiv_match = re.search(old_arxiv_pattern, query_text)
         
-        if arxiv_id_match:
-            paper_id = arxiv_id_match.group(1)
+        if arxiv_id_match or arxiv_url_match or old_arxiv_match:
+            if arxiv_id_match:
+                paper_id = arxiv_id_match.group(1)
+            elif arxiv_url_match:
+                paper_id = arxiv_url_match.group(1)
+            else:  # old_arxiv_match
+                category = old_arxiv_match.group(1)
+                id_num = old_arxiv_match.group(2)
+                paper_id = f"{category}/{id_num}"
+                
             entities["paper_id"] = paper_id
+            entities["tool"] = "get_paper_details"
             logger.info(f"[CLASSIFY] Matched paper ID pattern: '{paper_id}'")
             return QueryType.PAPER_DETAIL, entities
-        elif arxiv_url_match:
-            paper_id = arxiv_url_match.group(1)
-            entities["paper_id"] = paper_id
-            logger.info(f"[CLASSIFY] Matched paper URL pattern: '{paper_id}'")
-            return QueryType.PAPER_DETAIL, entities
-        elif old_arxiv_match:
-            category = old_arxiv_match.group(1)
-            id_num = old_arxiv_match.group(2)
-            paper_id = f"{category}/{id_num}"
-            entities["paper_id"] = paper_id
-            logger.info(f"[CLASSIFY] Matched old-style paper ID pattern: '{paper_id}'")
-            return QueryType.PAPER_DETAIL, entities
         
-        # Check for explicit author search patterns
-        author_patterns = ["papers by author", "author search", "find author", "search author"]
+        # Check for author profile patterns
+        author_patterns = [
+            "author profile", "papers by author", "author search", "find author", 
+            "search author", "who is author", "about author", "publications by"
+        ]
         
         for pattern in author_patterns:
             if pattern in text:
-                # Extract author name after the pattern
                 parts = text.split(pattern, 1)
-                if len(parts) > 1 and parts[1].strip():
+                if len(parts) > 1:
                     author_name = parts[1].strip()
-                    # Clean up author name - remove leading "by" if present
                     if author_name.startswith("by "):
                         author_name = author_name[3:].strip()
                     
                     entities["author"] = author_name
-                    entities["search_term"] = ""  # Empty search term, just use author filter
-                    logger.info(f"[CLASSIFY] Explicit author search for: '{author_name}'")
-                    return QueryType.SEARCH, entities
+                    entities["tool"] = "get_author_profile"
+                    logger.info(f"[CLASSIFY] Author profile request for: '{author_name}'")
+                    return QueryType.AUTHOR_PROFILE, entities
         
-        # Check for paper author patterns (questions about authors)
-        author_question_patterns = ["who is the author", "who wrote", "who are the authors", "authors of", "written by"]
-        paper_indicators = ["paper", "article", "publication", "research"]
+        # Check for general explanation patterns
+        explanation_patterns = [
+            "what is", "explain", "how does", "tell me about", "define", 
+            "describe", "discuss", "elaborate on", "can you explain"
+        ]
         
-        if any(ap in text for ap in author_question_patterns) and any(pi in text for pi in paper_indicators):
-            # This is an author question about a paper
-            logger.info("[CLASSIFY] Matched author query pattern")
-            
-            # Extract the paper name/topic
-            for ap in author_question_patterns:
-                if ap in text:
-                    rest = text.split(ap, 1)[1].strip()
-                    for pi in paper_indicators:
-                        if pi in rest:
-                            paper_name = rest.split(pi, 1)[1].strip()
-                            if paper_name:
-                                # Remove "the", "of" and other common words
-                                for word in ["the", "of", "about", "on", "for"]:
-                                    paper_name = paper_name.replace(f" {word} ", " ").strip()
-                                
-                                entities["paper_topic"] = paper_name
-                                logger.info(f"[CLASSIFY] Extracted paper topic: '{paper_name}'")
-                                
-                                if "last_papers" in session.metadata:
-                                    # Try to find a matching paper in previous results
-                                    last_papers = session.metadata["last_papers"]
-                                    for paper in last_papers:
-                                        title = paper.get("title", "").lower()
-                                        if paper_name in title or any(word in title for word in paper_name.split() if len(word) > 3):
-                                            logger.info(f"[CLASSIFY] Found matching paper in session: '{paper.get('title')}'")
-                                            return QueryType.FOLLOWUP, {"paper_topic": paper_name}
-            
-            # If we couldn't find a match in session, treat it as a new search
-            search_term = text
-            entities["search_term"] = search_term
-            logger.info(f"[CLASSIFY] Author query without session match, treating as search: '{search_term}'")
-            return QueryType.SEARCH, entities
+        for pattern in explanation_patterns:
+            if text.startswith(pattern) or f" {pattern} " in f" {text} ":
+                # Extract the concept to explain
+                concept = None
+                if text.startswith(pattern):
+                    concept = text[len(pattern):].strip()
+                else:
+                    parts = text.split(pattern, 1)
+                    if len(parts) > 1:
+                        concept = parts[1].strip()
+                
+                if concept:
+                    entities["query"] = concept
+                    entities["tool"] = "explain_concept"
+                    logger.info(f"[CLASSIFY] General explanation request for: '{concept}'")
+                    return QueryType.GENERAL_EXPLANATION, entities
         
         # Check for search patterns
-        search_patterns = ["find", "search", "look for", "papers about", "papers on", "research on", "articles about"]
+        search_patterns = [
+            "find papers", "search for papers", "look for papers", 
+            "papers about", "papers on", "research on", "articles about"
+        ]
         
-        if any(pattern in text for pattern in search_patterns):
-            # Extract the search term
-            for pattern in search_patterns:
-                if pattern in text:
-                    search_term = text.split(pattern, 1)[1].strip()
-                    if search_term:
-                        entities["search_term"] = search_term
-                        logger.info(f"[CLASSIFY] Matched search pattern: '{pattern}', Search term: '{search_term}'")
-                        return QueryType.SEARCH, entities
+        for pattern in search_patterns:
+            if pattern in text:
+                parts = text.split(pattern, 1)
+                if len(parts) > 1:
+                    search_term = parts[1].strip()
+                    entities["query"] = search_term
+                    entities["tool"] = "search_papers"
+                    logger.info(f"[CLASSIFY] Search request for: '{search_term}'")
+                    return QueryType.SEARCH, entities
         
-        # Default: treat as search with the whole query as the search term
-        entities["search_term"] = query_text
-        logger.info(f"[CLASSIFY] Default classification as search query: '{query_text}'")
+        # Check for follow-up queries if we have session context
+        if hasattr(session, "metadata") and "last_action" in session.metadata:
+            followup_patterns = [
+                "tell me more", "elaborate", "explain further", "details", "more information",
+                "continue", "expand", "what about", "follow up", "additional info"
+            ]
+            
+            if any(pattern in text for pattern in followup_patterns):
+                logger.info(f"[CLASSIFY] Matched follow-up pattern with session context")
+                return QueryType.FOLLOWUP, {}
+        
+        # If no specific pattern matched but query has academic or research terms,
+        # classify as GENERAL_EXPLANATION
+        academic_terms = [
+            "concept", "theory", "definition", "field", "research", "study",
+            "science", "technique", "method", "approach", "academic", "principle"
+        ]
+        
+        if any(term in text for term in academic_terms):
+            logger.info(f"[CLASSIFY] Detected academic term, classifying as general explanation")
+            entities["query"] = query_text
+            entities["tool"] = "explain_concept"
+            return QueryType.GENERAL_EXPLANATION, entities
+        
+        # Default to treating as a search query
+        entities["query"] = query_text
+        entities["tool"] = "search_papers"
+        logger.info(f"[CLASSIFY] Default classification as search: '{query_text}'")
         return QueryType.SEARCH, entities
     
     def _extract_paper_id(self, paper: Dict[str, Any]) -> Optional[str]:
@@ -1710,413 +1806,80 @@ IMPORTANT:
         query = result["query"]
         search_results = result["results"]
         filters = result.get("filters", {})
-        
-        # Get stored search parameters from session
-        session_state = session.metadata.get("state", {})
-        last_search_params = session_state.get("last_search_params", {})
-        
-        # Use stored parameters if available, otherwise use current filters
-        author_filter = last_search_params.get("author") or filters.get("author")
-        topic_filter = last_search_params.get("topic") or filters.get("topic")
-        date_filter = last_search_params.get("date_range") or filters.get("date_range")
-        sort_by = last_search_params.get("sort_by") or filters.get("sort_by")
-        
-        logger.info(f"[RESPONSE] Search results - Query: '{query}', Count: {len(search_results)}, Filters: {filters}")
-        
-        # Create notification message that includes filter information
-        search_message = f"Searching arXiv for papers"
-        if query:
-            search_message += f" about {query}"
-        if author_filter:
-            search_message += f" by author {author_filter}"
-        if topic_filter:
-            search_message += f" in category {topic_filter}"
-        if date_filter:
-            search_message += f" from {date_filter}"
-        search_message += "..."
+        summary = result.get("summary", "")
         
         # Notify user about the search
+        search_message = f"Searching arXiv for papers related to '{query}'"
+        if filters.get("author"):
+            search_message += f" by author {filters['author']}"
+        if filters.get("topic"):
+            search_message += f" in category {filters['topic']}"
+        if filters.get("date_range"):
+            search_message += f" from {filters['date_range']}"
+        search_message += "..."
+        
         await response_handler.emit_text_block(
             "SEARCH", search_message
         )
         
-        # Emit search results as JSON
         if len(search_results) > 0:
+            # Emit search results as JSON
             await response_handler.emit_json(
                 "PAPERS", {"results": search_results}
             )
             logger.info(f"[RESPONSE] Emitted {len(search_results)} papers as JSON")
             
-            try:
-                # Create summary of search results
-                logger.info("[RESPONSE] Generating search summary")
-                summary_stream = response_handler.create_text_stream("SEARCH_SUMMARY")
-                async for chunk in self._generate_search_summary(
-                    query, 
-                    search_results, 
-                    author=author_filter,
-                    sort_by=sort_by
-                ):
-                    filtered_chunk = self._filter_inappropriate_content(chunk)
-                    await summary_stream.emit_chunk(filtered_chunk)
-                await summary_stream.complete()
-                logger.info("[RESPONSE] Search summary generation complete")
-            except Exception as e:
-                logger.error(f"[RESPONSE] Error generating search summary: {str(e)}")
-                logger.error(traceback.format_exc())
-            
             # Create final response
             final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
             
-            try:
-                # Generate a concise, customized response that includes ALL papers
-                logger.info("[RESPONSE] Generating final response with all papers")
-                
-                # Build a prompt that requests summaries of all papers
-                # Create a dictionary of only the parameters that were actually used
-                search_params = {}
-                if author_filter:
-                    search_params["author"] = author_filter
-                if topic_filter:
-                    search_params["topic"] = topic_filter
-                if date_filter:
-                    search_params["date_range"] = date_filter
-                if sort_by and sort_by != "relevance":  # Only include if it's not the default
-                    search_params["sort_by"] = sort_by
-                if filters.get("category"):  # Include category if it was used
-                    search_params["category"] = filters["category"]
-                if filters.get("sort_by"):
-                    search_params["sort_by"] = filters["sort_by"]
-                
-                prompt = f"""
-                Generate a natural, conversational response about the {len(search_results)} papers I found related to "{query}" with the parameters used {json.dumps(search_params, indent=2)} in the search.
-                
-                Here are the papers:
-                {json.dumps([{
-                    "title": paper.get("title"),
-                    "authors": ", ".join(paper.get("authors", [])[:2]) + (" et al." if len(paper.get("authors", [])) > 2 else ""),
-                    "published": paper.get("published"),
-                    "primary_category": paper.get("primary_category", ""),
-                    "summary_snippet": paper.get("summary", "")[:150] + "..."
-                } for paper in search_results], indent=2)}
-                
-                Make your response:
-                1. Include a brief mention of EACH paper with its title and main topic
-                2. Group papers by theme if possible
-                3. Do NOT focus only on the first/most relevant paper
-                4. Tell the user they can ask for more details about any specific paper by providing the title or paper number
-                5. Be concise but comprehensive
-                6. Use formal academic language (no profanity or slang)
-                
-                EXTREMELY IMPORTANT: 
-                - DO NOT use informal language or slang
-                - DO NOT say "I found X papers" - instead, describe the papers themselves
-                - MENTION EACH PAPER by title, author and date of publication (in quotes) and briefly what it's about
-                - Include the PAPER NUMBER (1-5) before each title to make it easy for the user to reference and put it in new lines
-                """
-                
-                # Custom system prompt for a comprehensive response
-                system_prompt = (
-                    "You are a knowledgeable research assistant who specializes in scientific literature. "
-                    "Your responses are helpful, varied, and tailored to each query. "
-                    "When presenting search results, you briefly describe EACH paper found, "
-                    "not just the most relevant one. "
-                    "You maintain a scholarly tone while being conversational and helpful. "
-                    "When referring to arXiv categories, use their full names:\n"
-                    "Computer Science:\n"
-                    "- cs.AI: Artificial Intelligence\n"
-                    "- cs.AR: Hardware Architecture\n"
-                    "- cs.CC: Computational Complexity\n"
-                    "- cs.CE: Computational Engineering, Finance, and Science\n"
-                    "- cs.CG: Computational Geometry\n"
-                    "- cs.CL: Computation and Language\n"
-                    "- cs.CR: Cryptography and Security\n"
-                    "- cs.CV: Computer Vision and Pattern Recognition\n"
-                    "- cs.CY: Computers and Society\n"
-                    "- cs.DB: Databases\n"
-                    "- cs.DC: Distributed, Parallel, and Cluster Computing\n"
-                    "- cs.DL: Digital Libraries\n"
-                    "- cs.DM: Discrete Mathematics\n"
-                    "- cs.DS: Data Structures and Algorithms\n"
-                    "- cs.ET: Emerging Technologies\n"
-                    "- cs.FL: Formal Languages and Automata Theory\n"
-                    "- cs.GL: General Literature\n"
-                    "- cs.GR: Graphics\n"
-                    "- cs.GT: Game Theory\n"
-                    "- cs.HC: Human-Computer Interaction\n"
-                    "- cs.IR: Information Retrieval\n"
-                    "- cs.IT: Information Theory\n"
-                    "- cs.LG: Machine Learning\n"
-                    "- cs.LO: Logic in Computer Science\n"
-                    "- cs.MA: Multiagent Systems\n"
-                    "- cs.MM: Multimedia\n"
-                    "- cs.MS: Mathematical Software\n"
-                    "- cs.NA: Numerical Analysis\n"
-                    "- cs.NE: Neural and Evolutionary Computing\n"
-                    "- cs.NI: Networking and Internet Architecture\n"
-                    "- cs.OH: Other Computer Science\n"
-                    "- cs.OS: Operating Systems\n"
-                    "- cs.PF: Performance\n"
-                    "- cs.PL: Programming Languages\n"
-                    "- cs.RO: Robotics\n"
-                    "- cs.SC: Symbolic Computation\n"
-                    "- cs.SD: Sound\n"
-                    "- cs.SE: Software Engineering\n"
-                    "- cs.SI: Social and Information Networks\n"
-                    "- cs.SY: Systems and Control\n"
-                    "\nMathematics:\n"
-                    "- math.AG: Algebraic Geometry\n"
-                    "- math.AT: Algebraic Topology\n"
-                    "- math.AP: Analysis of PDEs\n"
-                    "- math.CT: Category Theory\n"
-                    "- math.CA: Classical Analysis and ODEs\n"
-                    "- math.CO: Combinatorics\n"
-                    "- math.AC: Commutative Algebra\n"
-                    "- math.CV: Complex Variables\n"
-                    "- math.DG: Differential Geometry\n"
-                    "- math.DS: Dynamical Systems\n"
-                    "- math.FA: Functional Analysis\n"
-                    "- math.GM: General Mathematics\n"
-                    "- math.GN: General Topology\n"
-                    "- math.GT: Geometric Topology\n"
-                    "- math.GR: Group Theory\n"
-                    "- math.HO: History and Overview\n"
-                    "- math.IT: Information Theory\n"
-                    "- math.KT: K-Theory and Homology\n"
-                    "- math.LO: Logic\n"
-                    "- math.MP: Mathematical Physics\n"
-                    "- math.MG: Metric Geometry\n"
-                    "- math.NT: Number Theory\n"
-                    "- math.NA: Numerical Analysis\n"
-                    "- math.OA: Operator Algebras\n"
-                    "- math.OC: Optimization and Control\n"
-                    "- math.PR: Probability\n"
-                    "- math.QA: Quantum Algebra\n"
-                    "- math.RT: Representation Theory\n"
-                    "- math.RA: Rings and Algebras\n"
-                    "- math.SP: Spectral Theory\n"
-                    "- math.ST: Statistics\n"
-                    "- math.SG: Symplectic Geometry\n"
-                    "\nPhysics:\n"
-                    "- physics.acc-ph: Accelerator Physics\n"
-                    "- physics.ao-ph: Atmospheric and Oceanic Physics\n"
-                    "- physics.atom-ph: Atomic Physics\n"
-                    "- physics.atm-clus: Atomic and Molecular Clusters\n"
-                    "- physics.bio-ph: Biological Physics\n"
-                    "- physics.chem-ph: Chemical Physics\n"
-                    "- physics.class-ph: Classical Physics\n"
-                    "- physics.comp-ph: Computational Physics\n"
-                    "- physics.data-an: Data Analysis, Statistics and Probability\n"
-                    "- physics.flu-dyn: Fluid Dynamics\n"
-                    "- physics.gen-ph: General Physics\n"
-                    "- physics.geo-ph: Geophysics\n"
-                    "- physics.hist-ph: History of Physics\n"
-                    "- physics.ins-det: Instrumentation and Detectors\n"
-                    "- physics.med-ph: Medical Physics\n"
-                    "- physics.optics: Optics\n"
-                    "- physics.ed-ph: Physics Education\n"
-                    "- physics.soc-ph: Physics and Society\n"
-                    "- physics.plasm-ph: Plasma Physics\n"
-                    "- physics.pop-ph: Popular Physics\n"
-                    "- physics.space-ph: Space Physics\n"
-                    "\nQuantitative Finance:\n"
-                    "- q-fin.CP: Computational Finance\n"
-                    "- q-fin.EC: Economics\n"
-                    "- q-fin.GN: General Finance\n"
-                    "- q-fin.MF: Mathematical Finance\n"
-                    "- q-fin.PM: Portfolio Management\n"
-                    "- q-fin.PR: Pricing of Securities\n"
-                    "- q-fin.RM: Risk Management\n"
-                    "- q-fin.ST: Statistical Finance\n"
-                    "- q-fin.TR: Trading and Market Microstructure\n"
-                    "\nStatistics:\n"
-                    "- stat.AP: Applications\n"
-                    "- stat.CO: Computation\n"
-                    "- stat.ML: Machine Learning\n"
-                    "- stat.ME: Methodology\n"
-                    "- stat.OT: Other Statistics\n"
-                    "- stat.TH: Theory\n"
-                    "\nEconomics:\n"
-                    "- econ.EM: Econometrics\n"
-                    "- econ.GN: General Economics\n"
-                    "- econ.TH: Theoretical Economics\n"
-                    "\nQuantitative Biology:\n"
-                    "- q-bio.BM: Biomolecules\n"
-                    "- q-bio.CB: Cell Behavior\n"
-                    "- q-bio.GN: Genomics\n"
-                    "- q-bio.MN: Molecular Networks\n"
-                    "- q-bio.NC: Neurons and Cognition\n"
-                    "- q-bio.OT: Other Quantitative Biology\n"
-                    "- q-bio.PE: Populations and Evolution\n"
-                    "- q-bio.QM: Quantitative Methods\n"
-                    "- q-bio.SC: Subcellular Processes\n"
-                    "- q-bio.TO: Tissues and Organs\n"
-                    "\nQuantitative Finance:\n"
-                    "- q-fin.CP: Computational Finance\n"
-                    "- q-fin.EC: Economics\n"
-                    "- q-fin.GN: General Finance\n"
-                    "- q-fin.MF: Mathematical Finance\n"
-                    "- q-fin.PM: Portfolio Management\n"
-                    "- q-fin.PR: Pricing of Securities\n"
-                    "- q-fin.RM: Risk Management\n"
-                    "- q-fin.ST: Statistical Finance\n"
-                    "- q-fin.TR: Trading and Market Microstructure\n"
-                    "\nNonlinear Sciences:\n"
-                    "- nlin.AO: Adaptation and Self-Organizing Systems\n"
-                    "- nlin.CD: Chaotic Dynamics\n"
-                    "- nlin.CG: Cellular Automata and Lattice Gases\n"
-                    "- nlin.PS: Pattern Formation and Solitons\n"
-                    "- nlin.SI: Exactly Solvable and Integrable Systems\n"
-                    "\nElectrical Engineering and Systems Science:\n"
-                    "- eess.AS: Audio and Speech Processing\n"
-                    "- eess.IV: Image and Video Processing\n"
-                    "- eess.SP: Signal Processing\n"
-                    "- eess.SY: Systems and Control\n"
-                    "\nAstrophysics:\n"
-                    "- astro-ph.CO: Cosmology and Nongalactic Astrophysics\n"
-                    "- astro-ph.EP: Earth and Planetary Astrophysics\n"
-                    "- astro-ph.GA: Astrophysics of Galaxies\n"
-                    "- astro-ph.HE: High Energy Astrophysical Phenomena\n"
-                    "- astro-ph.IM: Instrumentation and Methods for Astrophysics\n"
-                    "- astro-ph.SR: Solar and Stellar Astrophysics\n"
-                    "\nCondensed Matter:\n"
-                    "- cond-mat.dis-nn: Disordered Systems and Neural Networks\n"
-                    "- cond-mat.mes-hall: Mesoscopic Systems and Quantum Hall Effect\n"
-                    "- cond-mat.mtrl-sci: Materials Science\n"
-                    "- cond-mat.other: Other Condensed Matter\n"
-                    "- cond-mat.quant-gas: Quantum Gases\n"
-                    "- cond-mat.soft: Soft Condensed Matter\n"
-                    "- cond-mat.stat-mech: Statistical Mechanics\n"
-                    "- cond-mat.str-el: Strongly Correlated Electrons\n"
-                    "- cond-mat.supr-con: Superconductivity\n"
-                    "\nGeneral Relativity and Quantum Cosmology:\n"
-                    "- gr-qc: General Relativity and Quantum Cosmology\n"
-                    "\nHigh Energy Physics:\n"
-                    "- hep-ex: High Energy Physics - Experiment\n"
-                    "- hep-lat: High Energy Physics - Lattice\n"
-                    "- hep-ph: High Energy Physics - Phenomenology\n"
-                    "- hep-th: High Energy Physics - Theory\n"
-                    "\nMathematical Physics:\n"
-                    "- math-ph: Mathematical Physics\n"
-                    "\nNuclear Experiment:\n"
-                    "- nucl-ex: Nuclear Experiment\n"
-                    "\nNuclear Theory:\n"
-                    "- nucl-th: Nuclear Theory\n"
-                    "\nQuantum Physics:\n"
-                    "- quant-ph: Quantum Physics"
-                )
-                
-                logger.info(f"[RESPONSE] Calling model for final response with prompt of length {len(prompt)}")
-                response = await self._model_provider.query(prompt, system_prompt)
-                
-                # Apply content filtering
-                filtered_response = self._filter_inappropriate_content(response)
-                
-                logger.info(f"[RESPONSE] Generated final response of length {len(filtered_response)}")
-                
-                # Log a preview of the response
-                preview = filtered_response[:100] + "..." if len(filtered_response) > 100 else filtered_response
-                logger.info(f"[RESPONSE] Response preview: '{preview}'")
-                
-                await final_response_stream.emit_chunk(filtered_response)
-            except Exception as e:
-                logger.error(f"[RESPONSE] Error generating final response: {str(e)}")
-                logger.error(traceback.format_exc())
-                
-                # Fallback response that still covers all papers
-                fallback_response = f"Here are the papers I found related to \"{query}\":\n\n"
+            # If we have a summary from the result, use it
+            if summary:
+                await final_response_stream.emit_chunk(summary)
+            else:
+                # Generate our own response
+                formatted_response = f"I found {len(search_results)} papers related to '{query}':\n\n"
                 
                 for i, paper in enumerate(search_results):
-                    fallback_response += f"{i+1}. \"{paper.get('title')}\" by {', '.join(paper.get('authors', [])[:2])}"
-                    if len(paper.get('authors', [])) > 2:
-                        fallback_response += " et al."
-                    fallback_response += f" ({paper.get('published')})\n"
-                    fallback_response += f"   Category: {paper.get('primary_category', 'N/A')}\n"
+                    formatted_response += f"{i+1}. \"{paper['title']}\" by {', '.join(paper['authors'][:2])}"
+                    if len(paper['authors']) > 2:
+                        formatted_response += " et al."
+                    formatted_response += f" ({paper['published'].split('T')[0]})\n"
                     
-                    # Add a brief snippet of the summary
+                    # Add a brief summary
                     summary = paper.get('summary', '')
                     if summary:
                         summary_snippet = summary[:150] + "..." if len(summary) > 150 else summary
-                        fallback_response += f"   Summary: {summary_snippet}\n"
+                        formatted_response += f"   Summary: {summary_snippet}\n"
                     
-                    fallback_response += "\n"
+                    formatted_response += "\n"
                 
-                fallback_response += "You can ask for more details about any of these papers by referring to its number or title."
+                formatted_response += "You can ask for more details about any specific paper by referring to its number or title."
                 
-                logger.info("[RESPONSE] Using fallback response with all papers")
-                await final_response_stream.emit_chunk(fallback_response)
-                
+                await final_response_stream.emit_chunk(formatted_response)
+            
             await final_response_stream.complete()
         else:
-            # No results found - try searching without filters
-            logger.info("[RESPONSE] No search results found with filters, retrying without filters")
-            
-            # Retry search without filters
-            retry_result = await Tools.search_papers(
-                query=query,
-                session=session,
-                agent=self
-            )
-            
-            if len(retry_result["results"]) > 0:
-                # Found results without filters, handle them
-                await self._handle_search_response(retry_result, response_handler, session)
-                return
-            
-            # Still no results found - try breaking down the search term
-            logger.info("[RESPONSE] No search results found even without filters, trying with simplified search terms")
-            
-            # Break down the search term into key components
-            search_terms = query.split()
-            simplified_queries = []
-            
-            # Try different combinations of the search terms
-            if len(search_terms) > 2:
-                # Try with just the first two words
-                simplified_queries.append(" ".join(search_terms[:2]))
-                # Try with just the last two words
-                simplified_queries.append(" ".join(search_terms[-2:]))
-                # Try with just the first and last word
-                simplified_queries.append(f"{search_terms[0]} {search_terms[-1]}")
-            
-            # Try each simplified query
-            for simplified_query in simplified_queries:
-                logger.info(f"[RESPONSE] Trying simplified search with query: '{simplified_query}'")
-                retry_result = await Tools.search_papers(
-                    query=simplified_query,
-                    session=session,
-                    agent=self
-                )
-                
-                if len(retry_result["results"]) > 0:
-                    # Found results with simplified query, handle them
-                    await self._handle_search_response(retry_result, response_handler, session)
-                    return
-            
-            # Still no results found
-            logger.info("[RESPONSE] No search results found with any search strategy")
-            
-            # Create error message that includes filter context
-            error_message = f"No papers found"
-            if query:
-                error_message += f" matching '{query}'"
-            if author_filter:
-                error_message += f" by author {author_filter}"
-            if topic_filter:
-                error_message += f" in category {topic_filter}"
-            if date_filter:
-                error_message += f" from {date_filter}"
-            error_message += ". Please try a different search query."
-            
+            # No results found
             await response_handler.emit_text_block(
-                "ERROR", error_message
+                "NO_RESULTS", f"No papers found matching '{query}'"
             )
             
-            # Create final response stream
             final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-            await final_response_stream.emit_chunk(error_message)
-            await final_response_stream.complete()
             
+            # Suggest alternatives
+            suggestion_message = f"I couldn't find any papers matching '{query}'"
+            if filters.get("author") or filters.get("topic") or filters.get("date_range"):
+                suggestion_message += ". Consider trying again with fewer filters"
+                if filters.get("author"):
+                    suggestion_message += ", or check the spelling of the author name"
+                if filters.get("topic"):
+                    suggestion_message += ", or try a different category"
+            
+            suggestion_message += ". You could also try using more general keywords or a related research area."
+            
+            await final_response_stream.emit_chunk(suggestion_message)
+            await final_response_stream.complete()
+        
         # Mark response as complete
         await response_handler.complete()
         logger.info("[RESPONSE] Search response complete")
@@ -2134,11 +1897,6 @@ IMPORTANT:
         paper_id = result["paper_id"]
         found = result["found"]
         
-        # If we have a paper_title but no paper_id, use the title to search
-        if not paper_id and "paper_title" in result:
-            paper_id = result["paper_title"]
-            logger.info(f"[RESPONSE] Using paper title for search: '{paper_id}'")
-        
         # Notify user about fetching the paper
         await response_handler.emit_text_block(
             "FETCH_PAPER", f"Fetching details for paper {paper_id}..."
@@ -2146,6 +1904,8 @@ IMPORTANT:
         
         if found:
             paper = result["paper"]
+            summary = result.get("summary", "")
+            
             logger.info(f"[RESPONSE] Paper found: '{paper.get('title')}'")
             
             # Emit paper details as JSON
@@ -2153,170 +1913,37 @@ IMPORTANT:
                 "PAPER_DETAILS", {"paper": paper}
             )
             
-            try:
-                # Generate and stream paper summary
-                logger.info("[RESPONSE] Generating paper summary")
-                summary_stream = response_handler.create_text_stream("PAPER_SUMMARY")
-                async for chunk in self._model_provider.summarize_paper(paper, length="medium"):
-                    filtered_chunk = self._filter_inappropriate_content(chunk)
-                    await summary_stream.emit_chunk(filtered_chunk)
-                await summary_stream.complete()
-                logger.info("[RESPONSE] Paper summary generation complete")
-            except Exception as e:
-                logger.error(f"[RESPONSE] Error generating paper summary: {str(e)}")
-                logger.error(traceback.format_exc())
-            
             # Create final response
             final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
             
-            # Extract paper details
-            title = paper['title']
-            authors = ', '.join(paper['authors'][:3])
-            if len(paper['authors']) > 3:
-                authors += " et al."
-            published = paper['published']
-            categories = ', '.join(paper['categories'])
-            summary = paper.get('summary', '').strip()
-            
-            logger.info(f"[RESPONSE] Preparing final response for paper: '{title}'")
-            
-            # Generate different response based on whether this is a follow-up
-            if is_followup:
-                # For follow-up queries, provide a more detailed response
-                context = f"your search for \"{session.metadata.get('last_query', 'this topic')}\"" if "last_query" in session.metadata else "your previous query"
-                logger.info(f"[RESPONSE] Using context: '{context}' for follow-up response")
-                
-                try:
-                    prompt = f"""
-                    Generate a natural, conversational response providing details about this paper that was found in {context}.
-                    
-                    Paper details:
-                    Title: {title}
-                    Authors: {authors}
-                    Published: {published}
-                    Categories: {categories}
-                    
-                    Abstract:
-                    {summary}
-                    
-                    Make your response:
-                    1. Sound natural and engaging, not like a template
-                    2. Highlight 2-3 key points from the abstract
-                    3. Mention the paper's significance to the field
-                    4. Use formal academic language (no profanity or slang)
-                    5. Mention that the user can ask to find more papers by the same author
-                    
-                    EXTREMELY IMPORTANT: DO NOT use informal language, slang, or profanity of any kind. Keep your language strictly professional and academic.
-                    DO NOT start with phrases like "Here are the details" or "Here are the detailed information".
-                    """
-                    
-                    system_prompt = (
-                        "You are a professional academic research assistant. "
-                        "Your responses use formal scholarly language without ANY profanity or slang. "
-                        "You sound natural but maintain proper academic tone at all times. "
-                        "NEVER use inappropriate language, profanity, or casual slang terms. "
-                        "Maintain the highest standards of academic discourse at all times."
-                    )
-                    
-                    logger.info("[RESPONSE] Generating detailed follow-up response")
-                    response = await self._model_provider.query(prompt, system_prompt)
-                    
-                    # Apply content filtering
-                    filtered_response = self._filter_inappropriate_content(response)
-                    
-                    # Log a preview of the response
-                    preview = filtered_response[:100] + "..." if len(filtered_response) > 100 else filtered_response
-                    logger.info(f"[RESPONSE] Response preview: '{preview}'")
-                    
-                    # Add paper access links at the end
-                    if "arxiv.org" not in filtered_response:
-                        filtered_response += f"\n\nYou can access this paper at {paper['arxiv_url']} or download the PDF from {paper['pdf_url']}."
-                    
-                    await final_response_stream.emit_chunk(filtered_response)
-                except Exception as e:
-                    logger.error(f"[RESPONSE] Error generating detailed paper response: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    
-                    # Fallback response
-                    fallback_response = f"""
-                    The paper "{title}" by {authors} (published {published}) is in the {categories} field.
-                    
-                    Abstract:
-                    {summary}
-                    
-                    You can access this paper at {paper['arxiv_url']} or download the PDF from {paper['pdf_url']}.
-                    
-                    If you'd like to see more papers by {paper['authors'][0]}, just ask.
-                    """
-                    logger.info("[RESPONSE] Using fallback paper details response")
-                    await final_response_stream.emit_chunk(fallback_response)
+            # If we have a summary, use it; otherwise create our own response
+            if summary:
+                await final_response_stream.emit_chunk(summary)
             else:
-                # For direct paper requests, provide a more concise response
-                try:
-                    prompt = f"""
-                    Generate a natural, conversational response about this paper the user requested by ID.
-                    
-                    Paper details:
-                    Title: {title}
-                    Authors: {authors}
-                    Published: {published}
-                    Categories: {categories}
-                    
-                    Abstract:
-                    {summary}
-                    
-                    Make your response:
-                    1. Brief introduction to the paper (1 sentence)
-                    2. Summary of its main contribution (1-2 sentences)
-                    3. Mention the paper's access links
-                    4. Sound natural, not like a template
-                    5. Use formal academic language (no profanity or slang)
-                    6. Mention that the user can ask to find more papers by the first author
-                    
-                    EXTREMELY IMPORTANT: DO NOT use informal language, slang or profanity of any kind. Keep your language strictly professional and academic.
-                    DO NOT start with phrases like "I found the paper you requested".
-                    """
-                    
-                    system_prompt = (
-                        "You are a professional academic research assistant. "
-                        "Your responses use formal scholarly language without ANY profanity or slang. "
-                        "You sound natural but maintain proper academic tone at all times. "
-                        "NEVER use inappropriate language, profanity, or casual slang terms. "
-                        "Maintain the highest standards of academic discourse at all times."
-                    )
-                    
-                    logger.info("[RESPONSE] Generating paper response")
-                    response = await self._model_provider.query(prompt, system_prompt)
-                    
-                    # Apply content filtering
-                    filtered_response = self._filter_inappropriate_content(response)
-                    
-                    # Log a preview of the response
-                    preview = filtered_response[:100] + "..." if len(filtered_response) > 100 else filtered_response
-                    logger.info(f"[RESPONSE] Response preview: '{preview}'")
-                    
-                    # Add paper access links if not included
-                    if "arxiv.org" not in filtered_response:
-                        filtered_response += f"\n\nYou can access this paper at {paper['arxiv_url']} or download the PDF from {paper['pdf_url']}."
-                    
-                    await final_response_stream.emit_chunk(filtered_response)
-                except Exception as e:
-                    logger.error(f"[RESPONSE] Error generating paper response: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    
-                    # Fallback response
-                    fallback_response = f"""
-                    The paper "{title}" by {authors} was published on {published} in the {categories} field.
-                    
-                    Abstract:
-                    {summary[:300]}...
-                    
-                    You can access this paper at {paper['arxiv_url']} or download the PDF from {paper['pdf_url']}.
-                    
-                    If you'd like to see more papers by {paper['authors'][0]}, just ask.
-                    """
-                    logger.info("[RESPONSE] Using fallback paper response")
-                    await final_response_stream.emit_chunk(fallback_response)
+                # Extract paper details
+                title = paper['title']
+                authors = ', '.join(paper['authors'][:3])
+                if len(paper['authors']) > 3:
+                    authors += " et al."
+                published = paper['published'].split('T')[0]
+                categories = ', '.join(paper['categories'])
+                abstract = paper.get('summary', '')
+                
+                formatted_response = f"## {title}\n\n"
+                formatted_response += f"**Authors:** {authors}\n"
+                formatted_response += f"**Published:** {published}\n"
+                formatted_response += f"**Categories:** {categories}\n\n"
+                formatted_response += f"**Abstract:**\n{abstract}\n\n"
+                
+                # Add paper URLs if available
+                if 'arxiv_url' in paper:
+                    formatted_response += f"**arXiv URL:** {paper['arxiv_url']}\n"
+                if 'pdf_url' in paper:
+                    formatted_response += f"**PDF URL:** {paper['pdf_url']}\n\n"
+                
+                formatted_response += "You can ask me questions about this paper or explore other papers by these authors."
+                
+                await final_response_stream.emit_chunk(formatted_response)
             
             await final_response_stream.complete()
         else:
@@ -2331,33 +1958,17 @@ IMPORTANT:
             # Create a more helpful error response
             final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
             
-            # Check if we have previous search results to recommend
-            if "last_papers" in session.metadata and len(session.metadata["last_papers"]) > 0:
-                papers = session.metadata["last_papers"]
-                fallback_response = f"""
-                I couldn't find the specific paper with ID {paper_id}. This might be due to an error in the ID format or the paper may not be available on arXiv.
-                
-                However, based on your previous search, I can tell you about these papers instead:
-                
-                "{papers[0]['title']}" by {', '.join(papers[0]['authors'][:2])}
-                "{papers[1]['title']}" by {', '.join(papers[1]['authors'][:2])}
-                
-                Would you like me to get details about one of these papers instead?
-                """
-                logger.info("[RESPONSE] Using fallback with suggested papers")
-                await final_response_stream.emit_chunk(fallback_response)
-            else:
-                # Basic error if no previous results
-                await final_response_stream.emit_chunk(
-                    f"I couldn't find the paper with ID {paper_id} on arXiv. This might be due to an error in the ID format or the paper might not be accessible. Please check if the ID is correct and try again, or try searching for the paper by its title."
-                )
+            error_message = f"I couldn't find the paper with ID '{paper_id}'. "
+            error_message += "This could be due to an incorrect ID format or the paper might not be available on arXiv. "
+            error_message += "Please check the ID and try again, or try searching for the paper by its title."
             
+            await final_response_stream.emit_chunk(error_message)
             await final_response_stream.complete()
         
         # Mark response as complete
         await response_handler.complete()
         logger.info("[RESPONSE] Paper detail response handling complete")
-
+    
     async def _handle_paper_followup_response(
             self,
             paper: Dict[str, Any],
@@ -2368,15 +1979,6 @@ IMPORTANT:
         """Handle follow-up questions about the current paper."""
         logger.info(f"[RESPONSE] Handling follow-up on current paper: '{paper.get('title')}'")
         
-        # Extract paper details
-        title = paper['title']
-        authors = ', '.join(paper['authors'][:3])
-        if len(paper['authors']) > 3:
-            authors += " et al."
-        published = paper['published']
-        categories = ', '.join(paper['categories'])
-        summary = paper.get('summary', '').strip()
-        
         # Emit paper details as JSON again for context
         await response_handler.emit_json(
             "PAPER_DETAILS", {"paper": paper}
@@ -2386,489 +1988,156 @@ IMPORTANT:
         final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
         
         try:
-            # Generate a response focused on answering the specific follow-up question
-            prompt = f"""
-            Answer this follow-up question about a scientific paper:
+            # Track paper interactions in session metadata
+            paper_id = self._extract_paper_id(paper)
             
-            User's follow-up question: "{query_text}"
+            if not hasattr(session, "metadata"):
+                session.metadata = {}
             
-            Paper details:
-            Title: {title}
-            Authors: {authors}
-            Published: {published}
-            Categories: {categories}
+            # Initialize or get paper interaction history
+            paper_interactions = session.metadata.get("paper_interactions", {})
             
-            Abstract:
-            {summary}
+            # Get the interaction count and history for this paper
+            if paper_id not in paper_interactions:
+                paper_interactions[paper_id] = {
+                    "count": 0,
+                    "queries": []
+                }
             
-            Make your response:
-            1. Directly address the user's specific question about the paper
-            2. Use information from the paper details and abstract
-            3. Sound natural and knowledgeable
-            4. Use formal academic language (absolutely no profanity or slang)
-            5. Be thorough but concise
-            6. If relevant, mention that the user can ask to find more papers by the first author
+            # Update interaction count and add this query
+            paper_interactions[paper_id]["count"] += 1
+            paper_interactions[paper_id]["queries"].append(query_text)
+            interaction_count = paper_interactions[paper_id]["count"]
+            previous_queries = paper_interactions[paper_id]["queries"][:-1]  # All except current
             
-            EXTREMELY IMPORTANT: DO NOT use informal language, slang or profanity of any kind. Keep your language strictly professional and academic.
+            # Store back in session
+            session.metadata["paper_interactions"] = paper_interactions
+            
+            # Update session in global store
+            await self._update_session(session)
+            
+            logger.info(f"[RESPONSE] Paper {paper_id} interaction count: {interaction_count}")
+            
+            # Let the LLM determine how to handle this follow-up based on the full context
+            task_instructions = """
+            Analyze paper interaction history to provide tailored follow-up responses.
+            For repeat interactions, provide progressively deeper analysis without repetition.
+            For first-time or specific questions, focus on directly answering the query.
             """
             
-            system_prompt = (
-                "You are a professional academic research assistant specializing in scientific papers. "
-                "Your responses use formal scholarly language without ANY profanity or slang. "
-                "You answer specific questions about academic papers with precision and nuance. "
-                "NEVER use inappropriate language, profanity, or casual slang terms. "
-                "Maintain the highest standards of academic discourse at all times."
-            )
+            # First determine the response strategy with the LLM
+            strategy_prompt = f"""
+            User query: "{query_text}"
             
-            logger.info("[RESPONSE] Generating paper follow-up response")
-            response = await self._model_provider.query(prompt, system_prompt)
+            Paper information:
+            Title: {paper.get('title')}
+            Authors: {', '.join(paper.get('authors', []))}
+            Published: {paper.get('published').split('T')[0]}
+            Categories: {', '.join(paper.get('categories', []))}
             
-            # Apply content filtering
+            Interaction history with this paper:
+            - Times this paper has been discussed: {interaction_count}
+            - Previous queries about this paper: {previous_queries if previous_queries else "None"}
+            
+            ANALYZE this situation and determine the appropriate response strategy:
+            1. If this is a REPEAT generic request for information about a paper already discussed, respond with STRATEGY: DEEPER_ANALYSIS
+            2. If this is a SPECIFIC question needing a direct answer, respond with STRATEGY: DIRECT_ANSWER
+            3. If this is the FIRST interaction with this paper, respond with STRATEGY: INITIAL_SUMMARY
+            
+            Return ONLY the strategy identifier, no other text.
+            """
+            
+            strategy = await self._model_provider.query(strategy_prompt, task_instructions)
+            strategy = strategy.strip().upper()
+            
+            logger.info(f"[RESPONSE] LLM-determined strategy: {strategy}")
+            
+            # Generate response based on the determined strategy
+            if "DEEPER_ANALYSIS" in strategy:
+                user_prompt = f"""
+                The user is asking for more information about this paper:
+                Title: {paper.get('title')}
+                Authors: {', '.join(paper.get('authors', []))}
+                Published: {paper.get('published').split('T')[0]}
+                Categories: {', '.join(paper.get('categories', []))}
+                Abstract: {paper.get('summary', '')}
+                
+                Their question is: "{query_text}"
+                
+                IMPORTANT: This is interaction #{interaction_count} with this paper.
+                Previous queries: {previous_queries}
+                
+                Provide a DEEPER ANALYSIS that includes:
+                1. Methodology and technical approach analysis
+                2. Implications and applications of this research
+                3. Relationships to broader research fields
+                4. Critical analysis of strengths/limitations
+                5. Specific follow-up questions the user could ask
+                
+                AVOID repeating information already likely covered in previous interactions.
+                Focus on providing new insights and perspectives.
+                Use scholarly language and academic reasoning.
+                """
+            elif "DIRECT_ANSWER" in strategy:
+                user_prompt = f"""
+                The user is asking a specific question about this paper:
+                Title: {paper.get('title')}
+                Authors: {', '.join(paper.get('authors', []))}
+                Published: {paper.get('published').split('T')[0]}
+                Categories: {', '.join(paper.get('categories', []))}
+                Abstract: {paper.get('summary', '')}
+                
+                Their specific question is: "{query_text}"
+                
+                Please provide:
+                1. A direct answer to their specific question
+                2. Only include context from the paper if directly relevant to the question
+                3. Be concise and scholarly in your response
+                """
+            else:  # Default to INITIAL_SUMMARY
+                user_prompt = f"""
+                The user is asking about this paper:
+                Title: {paper.get('title')}
+                Authors: {', '.join(paper.get('authors', []))}
+                Published: {paper.get('published').split('T')[0]}
+                Categories: {', '.join(paper.get('categories', []))}
+                Abstract: {paper.get('summary', '')}
+                
+                Their question is: "{query_text}"
+                
+                Since this is the first detailed discussion of this paper, please provide:
+                1. A concise overview of the paper's main contributions
+                2. Brief context about the research area
+                3. How this paper relates to the field
+                4. Suggestions for further exploration
+                """
+            
+            response = await self._model_provider.query(user_prompt, task_instructions)
             filtered_response = self._filter_inappropriate_content(response)
-            
-            # Log a preview of the response
-            preview = filtered_response[:100] + "..." if len(filtered_response) > 100 else filtered_response
-            logger.info(f"[RESPONSE] Follow-up response preview: '{preview}'")
             
             await final_response_stream.emit_chunk(filtered_response)
         except Exception as e:
-            logger.error(f"[RESPONSE] Error generating paper follow-up response: {str(e)}")
-            logger.error(traceback.format_exc())
+            logger.error(f"[RESPONSE] Error generating follow-up response: {str(e)}")
             
             # Fallback response
-            fallback_response = f"""
-            Regarding your question about "{title}":
+            title = paper.get('title', 'this paper')
+            authors = ', '.join(paper.get('authors', [])[:2])
+            if len(paper.get('authors', [])) > 2:
+                authors += " et al."
+            abstract = paper.get('summary', 'No abstract available.')
             
-            The paper was authored by {authors} and published on {published} in the {categories} field.
+            fallback_message = f"Regarding your question about \"{title}\" by {authors}:\n\n"
+            fallback_message += f"The paper abstract mentions: {abstract[:200]}...\n\n"
+            fallback_message += "For more specific details, you may want to read the full paper or ask a more specific question."
             
-            Based on the abstract, the paper focuses on {summary[:150]}...
-            
-            You can access the full paper at {paper['arxiv_url']} for more details.
-            
-            If you'd like to see more papers by {paper['authors'][0]}, feel free to ask.
-            """
-            logger.info("[RESPONSE] Using fallback follow-up response")
-            await final_response_stream.emit_chunk(fallback_response)
+            await final_response_stream.emit_chunk(fallback_message)
         
         await final_response_stream.complete()
         
         # Mark response as complete
         await response_handler.complete()
-        logger.info("[RESPONSE] Paper follow-up response handling complete")
+        logger.info("[RESPONSE] Follow-up response handling complete")
     
-    async def _handle_agent_info_response(
-            self,
-            result: Dict[str, Any],
-            response_handler: ResponseHandler
-    ):
-        """Handle responses about the agent itself."""
-        logger.info(f"[RESPONSE] Handling agent info response to query: '{result.get('query', '')}'")
-        
-        name = result["name"]
-        description = result["description"]
-        capabilities = result["capabilities"]
-        user_query = result.get("query", "")
-        
-        # Create a prompt for the LLM to generate a more natural response about the agent
-        try:
-            prompt = f"""
-            The user asked about you with this query: "{user_query}"
-            
-            Generate a natural, conversational response explaining who you are as {name}.
-            
-            About you:
-            {description}
-            
-            Your capabilities:
-            {', '.join(capabilities)}
-            
-            Make your response:
-            1. Sound natural and conversational
-            2. Be informative about what you can help with
-            3. Invite the user to ask about papers they're interested in
-            4. Be friendly but professional
-            5. Do not use bullet points or lists
-            6. Address their specific question about you
-            7. Use formal academic language while remaining approachable
-            8. describe your capabilities in a numbered list (each number should be in a new line)
-            """
-            
-            system_prompt = (
-                "You are a helpful research assistant specializing in scientific papers. "
-                "Your responses are natural, helpful, and inviting. "
-                "You explain your capabilities clearly but conversationally. "
-                "You address specific questions about yourself in a professional yet engaging way. "
-                "You maintain a scholarly tone while being approachable and helpful."
-            )
-            
-            logger.info("[RESPONSE] Generating agent info response with LLM")
-            response = await self._model_provider.query(prompt, system_prompt)
-            
-            # Create final response stream
-            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-            await final_response_stream.emit_chunk(response)
-            await final_response_stream.complete()
-            
-        except Exception as e:
-            logger.error(f"[RESPONSE] Error generating LLM agent info: {str(e)}")
-            
-            # Fall back to template response if LLM fails
-            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-            
-            # Create a concise, informative response about the agent
-            fallback_response = f"""
-            I am {name}, an AI research assistant specialized in finding and explaining scientific papers from arXiv. 
-
-            I can help you search for papers on specific topics, retrieve and explain individual papers by ID, find papers by specific authors, summarize research findings, and provide academic context for search results.
-
-            Just ask me to find papers on a topic you're interested in, and I'll help you explore the research.
-            """
-            
-            logger.info("[RESPONSE] Using fallback agent info response")
-            await final_response_stream.emit_chunk(fallback_response)
-            await final_response_stream.complete()
-        
-        # Mark response as complete
-        await response_handler.complete()
-        logger.info("[RESPONSE] Agent info response complete")
-
-    async def _handle_greeting_response(
-            self,
-            greeting: str,
-            response_handler: ResponseHandler
-    ):
-        """Handle greeting responses."""
-        logger.info(f"[RESPONSE] Handling greeting response to: '{greeting}'")
-        
-        # Try to use the LLM for a more varied greeting
-        try:
-            prompt = f"""
-            The user greeted you with: "{greeting}"
-            
-            Generate a friendly, informative response as an arXiv research agent. 
-            Acknowledge their greeting and explain your key capabilities in a clear, engaging way.
-            
-            Your capabilities include:
-            1. Searching for academic papers on any topic
-            2. Providing detailed summaries of specific papers
-            3. Finding papers by specific authors
-            4. Analyzing research trends
-            5. Answering follow-up questions about papers
-            6. Helping explore research topics
-            7. Looking up author profiles and their publication history
-            
-            Make your response:
-            1. Warm and professional
-            2. Clear about what you can do
-            3. Inviting for the user to start exploring
-            4. 2-3 sentences long
-            5. Natural and varied (not templated)
-            6. Use formal academic language while remaining approachable
-            7. Acknowledge their greeting in a natural way
-            8. describe your capabilities in a numbered list (each number should be in a new line)
-            
-
-            """
-            
-            system_prompt = (
-                "You are an AI research agent specializing in finding and explaining scientific papers from arXiv. "
-                "Your responses are professional, informative, and engaging. "
-                "You clearly communicate your capabilities while maintaining a scholarly tone. "
-                "You make academic research accessible and exciting. "
-                "You acknowledge greetings naturally and maintain a friendly yet professional demeanor."
-            )
-            
-            logger.info("[RESPONSE] Generating LLM greeting response")
-            response = await self._model_provider.query(prompt, system_prompt)
-            
-            # Create final response stream
-            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-            await final_response_stream.emit_chunk(response)
-            await final_response_stream.complete()
-            
-        except Exception as e:
-            logger.error(f"[RESPONSE] Error generating LLM greeting: {str(e)}")
-            
-            # Fall back to template responses if LLM fails
-            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-            
-            # Choose a response that matches the greeting style
-            greeting_lower = greeting.lower()
-            if any(g in greeting_lower for g in ["hi", "hey"]):
-                response = "Hi there! I'm here to help you navigate the world of academic research. I can search for papers, analyze research trends, and provide detailed insights about specific works. What topic interests you?"
-            elif "greetings" in greeting_lower:
-                response = "Greetings! I'm your AI research assistant, specialized in finding and explaining scientific papers from arXiv. I can help you explore research topics, analyze papers, and discover new academic insights. How can I assist you today?"
-            else:
-                response = "Hello! I'm your arXiv research assistant. I can help you search for papers, analyze research trends, and provide detailed summaries of academic work. What would you like to explore today?"
-            
-            logger.info(f"[RESPONSE] Selected fallback greeting response: '{response}'")
-            
-            await final_response_stream.emit_chunk(response)
-            await final_response_stream.complete()
-        
-        # Mark response as complete
-        await response_handler.complete()
-        logger.info("[RESPONSE] Greeting response complete")
-
-    async def _handle_error_response(
-            self,
-            error_message: str,
-            response_handler: ResponseHandler
-    ):
-        """Handle error responses."""
-        logger.error(f"[RESPONSE] Error response: {error_message}")
-        
-        await response_handler.emit_text_block(
-            "ERROR", error_message
-        )
-        
-        # Try to use the LLM for a more helpful error response
-        try:
-            prompt = f"""
-            The user's query resulted in this error: "{error_message}"
-            
-            Generate a helpful, informative response that:
-            1. Acknowledges the error in a professional way
-            2. Explains what might have gone wrong
-            3. Provides specific suggestions for how to fix the issue
-            4. Maintains a helpful and encouraging tone
-            5. Uses formal academic language
-            6. Keeps the response concise (2-3 sentences)
-            
-            Example structure:
-            "I apologize, but I couldn't process your request. This might be due to [specific reason]. Please try [specific suggestion] or rephrase your query."
-            """
-            
-            system_prompt = (
-                "You are a professional academic research assistant. "
-                "Your error responses are helpful, specific, and encouraging. "
-                "You provide clear guidance on how to resolve issues. "
-                "You maintain a scholarly tone while being supportive and helpful."
-            )
-            
-            logger.info("[RESPONSE] Generating error response with LLM")
-            response = await self._model_provider.query(prompt, system_prompt)
-            
-            # Create final response stream
-            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-            await final_response_stream.emit_chunk(response)
-            await final_response_stream.complete()
-            
-        except Exception as e:
-            logger.error(f"[RESPONSE] Error generating LLM error response: {str(e)}")
-            
-            # Fall back to template response if LLM fails
-            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-            await final_response_stream.emit_chunk(
-                f"{error_message} Please try again with a different query."
-            )
-            await final_response_stream.complete()
-        
-        # Mark response as complete
-        await response_handler.complete()
-        logger.info("[RESPONSE] Error response complete")
-    
-    async def _handle_list_all_papers_response(
-            self,
-            session: Session,
-            response_handler: ResponseHandler
-    ):
-        """
-        Handle requests to list all papers from previous searches.
-        This combines papers from multiple searches if available.
-        """
-        logger.info("[RESPONSE] Handling list all papers request")
-        
-        # Get the most recent search results
-        last_papers = session.metadata.get("last_papers", [])
-        previous_search_query = session.metadata.get("last_query", "your search")
-        
-        if not last_papers:
-            await response_handler.emit_text_block(
-                "NO_RESULTS", "No papers found in your previous searches."
-            )
-            
-            final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-            await final_response_stream.emit_chunk(
-                "I don't have any previous search results to show. Please try searching for papers first."
-            )
-            await final_response_stream.complete()
-            await response_handler.complete()
-            return
-        
-        # Emit the papers as JSON
-        await response_handler.emit_json(
-            "PAPERS", {"results": last_papers}
-        )
-        logger.info(f"[RESPONSE] Emitted {len(last_papers)} papers from previous search")
-        
-        # Create final response
-        final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
-        
-        try:
-            # Generate a response listing all papers with brief descriptions
-            prompt = f"""
-            Create a concise, formatted list of the papers from the previous search on "{previous_search_query}".
-            
-            Here are the papers:
-            {json.dumps([{
-                "title": paper.get("title"),
-                "authors": ", ".join(paper.get("authors", [])[:2]),
-                "published": paper.get("published"),
-                "summary": paper.get("summary", "")[:100] + "..."
-            } for paper in last_papers], indent=2)}
-            
-            For each paper:
-            1. Start with the title in quotes, followed by the authors
-            2. Add a very brief (1 sentence) description of what the paper is about
-            3. Number each paper entry
-            
-            At the end, mention that the user can ask for more details about any specific paper.
-            Use formal academic language throughout.
-            """
-            
-            system_prompt = (
-                "You are a professional academic research assistant. "
-                "Your responses are clear, organized, and formatted for readability. "
-                "You help researchers identify papers of interest from search results."
-            )
-            
-            logger.info("[RESPONSE] Generating list all papers response")
-            response = await self._model_provider.query(prompt, system_prompt)
-            
-            # Apply content filtering
-            filtered_response = self._filter_inappropriate_content(response)
-            
-            # Log a preview of the response
-            preview = filtered_response[:100] + "..." if len(filtered_response) > 100 else filtered_response
-            logger.info(f"[RESPONSE] List papers response preview: '{preview}'")
-            
-            await final_response_stream.emit_chunk(filtered_response)
-        except Exception as e:
-            logger.error(f"[RESPONSE] Error generating list papers response: {str(e)}")
-            logger.error(traceback.format_exc())
-            
-            # Fallback manual listing
-            fallback_response = f"Here are the papers from your search on \"{previous_search_query}\":\n\n"
-            
-            for i, paper in enumerate(last_papers):
-                fallback_response += f"{i+1}. \"{paper.get('title')}\" by {', '.join(paper.get('authors', [])[:2])}\n"
-            
-            fallback_response += "\nYou can ask for more details about any of these papers."
-            
-            logger.info("[RESPONSE] Using fallback list papers response")
-            await final_response_stream.emit_chunk(fallback_response)
-        
-        await final_response_stream.complete()
-        
-        # Mark response as complete
-        await response_handler.complete()
-        logger.info("[RESPONSE] List papers response handling complete")
-    
-    async def _generate_search_summary(
-            self,
-            query: str,
-            papers: List[Dict[str, Any]],
-            author: str = None,
-            sort_by: str = None
-    ) -> AsyncIterator[str]:
-        """Generate a comprehensive summary of all search results."""
-        context = f"search query: \"{query}\"" if query else "search"
-        if author:
-            context = f"search for papers by author \"{author}\""
-            if query:
-                context += f" related to \"{query}\""
-        
-        # Add sorting information to context
-        sort_info = f" (sorted by {sort_by if sort_by else 'submission date'})"
-        context += sort_info
-        
-        logger.info(f"[SUMMARY] Generating search summary for {context}")
-        
-        # Create a prompt for summarizing the search results
-        papers_text = "\n\n".join([
-            f"Title: {paper['title']}\n"
-            f"Authors: {', '.join(paper['authors'])}\n"
-            f"Published: {paper['published']}\n"
-            f"Categories: {', '.join(paper['categories'])}\n"
-            f"Summary: {paper['summary'][:200]}..."
-            for paper in papers
-        ])
-        
-        prompt = f"""
-        Based on the {context}, I found these papers on arXiv:
-        
-        {papers_text}
-        
-        Please provide:
-        1. A brief overview of EACH paper found (1-2 sentences per paper)
-        2. How they relate to the {context} (1-2 sentences)
-        3. Any thematic connections between the papers (1-2 sentences)
-        
-        IMPORTANT: 
-        - Cover ALL papers, not just the most relevant ones
-        - Number each paper discussion (1-5)
-        - Provide equal attention to each paper
-        - Group papers by theme if possible
-        - Use formal academic language throughout
-        - DO NOT use informal language, slang, or profanity
-        """
-        
-        # Custom system prompt for search summary with enhanced content filtering
-        system_prompt = (
-            "You are a professional academic research assistant specializing in scientific literature. "
-            "You help researchers understand available papers on topics using formal, scholarly language. "
-            "You provide comprehensive coverage of ALL papers found, not just the most relevant ones. "
-            "NEVER use casual expressions, slang, or profanity in your analyses. Maintain a professional, "
-            "objective tone suitable for publication in an academic journal. "
-            "Under no circumstances should you use ANY inappropriate language."
-        )
-        
-        logger.info(f"[SUMMARY] Sending prompt of length {len(prompt)} to model")
-        
-        try:
-            max_retries = 2
-            retry_count = 0
-            
-            while True:
-                try:
-                    async for chunk in self._model_provider.query_stream(prompt, system_prompt):
-                        filtered_chunk = self._filter_inappropriate_content(chunk)
-                        yield filtered_chunk
-                    logger.info("[SUMMARY] Successfully completed search summary generation")
-                    break
-                except (RateLimitError, APIError, APITimeoutError) as e:
-                    retry_count += 1
-                    if retry_count > max_retries:
-                        logger.error(f"[SUMMARY] Max retries exceeded: {str(e)}")
-                        raise
-                    
-                    delay = 2 ** retry_count * (1 + 0.1 * random.random())
-                    logger.warning(f"[SUMMARY] API error in search summary: {str(e)}. Retrying in {delay:.2f}s ({retry_count}/{max_retries})")
-                    await asyncio.sleep(delay)
-        except Exception as e:
-            # Provide a simpler fallback response that still covers all papers
-            logger.error(f"[SUMMARY] Error generating search summary: {str(e)}")
-            logger.error(traceback.format_exc())
-            
-            logger.info("[SUMMARY] Using fallback summary response")
-            
-            author_context = f" by {author}" if author else ""
-            query_context = f" on \"{query}\"" if query else ""
-            
-            simple_summary = f"Based on your search{author_context}{query_context}, I found {len(papers)} relevant papers:\n\n"
-            yield simple_summary
-            
-            for i, paper in enumerate(papers):
-                paper_summary = f"{i+1}. \"{paper['title']}\" by {', '.join(paper['authors'][:2])}\n"
-                paper_summary += f"   Published: {paper['published']}\n"
-                paper_summary += f"   Categories: {', '.join(paper['categories'])}\n"
-                paper_summary += f"   Summary: {paper['summary'][:150]}...\n\n"
-                yield paper_summary
-            
-            yield "You can ask for more details about any of these papers."
-            logger.info("[SUMMARY] Fallback summary generation complete")
-
     async def _handle_author_profile_response(
             self,
             result: Dict[str, Any],
@@ -2888,6 +2157,8 @@ IMPORTANT:
         
         if found:
             profile = result["profile"]
+            summary = result.get("summary", "")
+            
             logger.info(f"[RESPONSE] Author profile found for: '{author_name}'")
             
             # Emit author profile as JSON
@@ -2895,103 +2166,44 @@ IMPORTANT:
                 "AUTHOR_PROFILE", {"profile": profile}
             )
             
-            try:
-                # Generate and stream author profile summary
-                logger.info("[RESPONSE] Generating author profile summary")
-                summary_stream = response_handler.create_text_stream("AUTHOR_SUMMARY")
-                async for chunk in self._generate_author_summary(profile):
-                    filtered_chunk = self._filter_inappropriate_content(chunk)
-                    await summary_stream.emit_chunk(filtered_chunk)
-                await summary_stream.complete()
-                logger.info("[RESPONSE] Author profile summary generation complete")
-            except Exception as e:
-                logger.error(f"[RESPONSE] Error generating author summary: {str(e)}")
-                logger.error(traceback.format_exc())
-            
             # Create final response
             final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
             
-            try:
-                # Generate a detailed, conversational profile
-                prompt = f"""
-                Create a detailed profile summary for author {author_name} based on their publications.
+            # If we have a summary, use it; otherwise create our own response
+            if summary:
+                await final_response_stream.emit_chunk(summary)
+            else:
+                # Extract profile details
+                paper_count = profile.get('paper_count', 0)
+                research_interests = [item.get('category') for item in profile.get('research_interests', [])[:3]]
+                papers = profile.get('papers', [])
+                co_authors = profile.get('co_authors', [])[:5]
+                timeline = profile.get('publication_timeline', [])
                 
-                Author information:
-                - Name: {author_name}
-                - Total publications found: {profile['paper_count']}
-                - Top research areas: {', '.join([item['category'] for item in profile['research_interests'][:3]])}
-                - Publication timeline: {json.dumps(profile['publication_timeline'])}
-                - Recent co-authors: {', '.join(profile['co_authors'][:5])}
+                # Format the response
+                formatted_response = f"## Author Profile: {author_name}\n\n"
+                formatted_response += f"**Papers on arXiv:** {paper_count}\n"
                 
-                Recent papers (up to 5):
-                {json.dumps([{
-                    "title": paper.get("title"),
-                    "published": paper.get("published"),
-                    "categories": paper.get("categories", []),
-                    "summary": paper.get("summary", "")[:150] + "..."
-                } for paper in profile['papers'][:5]], indent=2)}
+                if research_interests:
+                    formatted_response += f"**Main research areas:** {', '.join(research_interests)}\n\n"
                 
-                Make your response:
-                1. Start with a brief professional introduction of the author based on their research focus
-                2. Describe their research interests and how they've evolved over time (if visible in the timeline)
-                3. Mention their publication activity and recent work
-                4. Highlight 2-3 of their most recent or significant papers with brief descriptions
-                5. Mention key collaborators if notable patterns exist
-                6. Conclude with a summary of their contribution to their field
-                7. End by asking if the user would like to explore any specific paper
+                if timeline:
+                    formatted_response += "**Publication Timeline:**\n"
+                    timeline_str = ", ".join([f"{item.get('year')}: {item.get('papers')} papers" for item in timeline])
+                    formatted_response += f"{timeline_str}\n\n"
                 
-                Use formal academic language, be objective and thorough.
-                """
+                if papers:
+                    formatted_response += "**Recent Papers:**\n"
+                    for i, paper in enumerate(papers[:3]):
+                        formatted_response += f"{i+1}. \"{paper.get('title')}\" ({paper.get('published').split('T')[0]})\n"
                 
-                system_prompt = (
-                    "You are a professional academic research assistant specializing in author profiles. "
-                    "Your summaries provide comprehensive, objective overviews of researchers based on "
-                    "their publication history. You identify patterns in their work and highlight their "
-                    "key contributions to their field. Your tone is formal, scholarly, and precise."
-                )
+                if co_authors:
+                    formatted_response += f"\n**Key Collaborators:** {', '.join(co_authors)}\n\n"
                 
-                logger.info(f"[RESPONSE] Calling model for author profile with prompt of length {len(prompt)}")
-                response = await self._model_provider.query(prompt, system_prompt)
+                formatted_response += "You can ask for more details on any of the papers or explore specific research areas."
                 
-                # Apply content filtering
-                filtered_response = self._filter_inappropriate_content(response)
-                
-                logger.info(f"[RESPONSE] Generated author profile of length {len(filtered_response)}")
-                
-                await final_response_stream.emit_chunk(filtered_response)
-            except Exception as e:
-                logger.error(f"[RESPONSE] Error generating author profile: {str(e)}")
-                logger.error(traceback.format_exc())
-                
-                # Fallback response
-                fallback_response = f"## Author Profile: {author_name}\n\n"
-                
-                # Research interests
-                fallback_response += "### Research Interests\n"
-                for interest in profile['research_interests'][:5]:
-                    fallback_response += f"- {interest['category']} ({interest['count']} papers)\n"
-                
-                # Publication history
-                fallback_response += "\n### Publication History\n"
-                for year_data in profile['publication_timeline']:
-                    fallback_response += f"- {year_data['year']}: {year_data['papers']} publications\n"
-                
-                # Recent papers
-                fallback_response += "\n### Recent Publications\n"
-                for i, paper in enumerate(profile['papers'][:5]):
-                    fallback_response += f"{i+1}. \"{paper.get('title')}\" ({paper.get('published')})\n"
-                    fallback_response += f"   Categories: {', '.join(paper.get('categories', ['N/A']))}\n\n"
-                
-                # Co-authors
-                fallback_response += "\n### Key Collaborators\n"
-                for coauthor in profile['co_authors'][:5]:
-                    fallback_response += f"- {coauthor}\n"
-                
-                fallback_response += "\nYou can ask for more details about any of these papers or request additional information about this author's work."
-                
-                logger.info("[RESPONSE] Using fallback author profile")
-                await final_response_stream.emit_chunk(fallback_response)
-                
+                await final_response_stream.emit_chunk(formatted_response)
+            
             await final_response_stream.complete()
         else:
             # Author not found
@@ -2999,176 +2211,463 @@ IMPORTANT:
             logger.error(f"[RESPONSE] Author not found: {error}")
             
             await response_handler.emit_text_block(
-                "ERROR", f"Could not find information for author: {error}"
+                "ERROR", f"Could not find author profile: {error}"
             )
             
             # Create a more helpful error response
             final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
             
-            await final_response_stream.emit_chunk(
-                f"I couldn't find detailed information for author '{author_name}'. This might be due to:"
-                f"\n\n- Variant spellings of the author's name"
-                f"\n- The author using a different name format in publications"
-                f"\n- Limited publication history on arXiv"
-                f"\n\nTry searching for papers by this author with a more general query like 'search for papers by {author_name}'."
-            )
+            error_message = f"I couldn't find an author profile for '{author_name}'. "
+            error_message += "This could be due to different name formats used by the author in publications or limited presence on arXiv. "
+            error_message += "Try variations of the name format or search for papers by this author with a more general query."
             
+            await final_response_stream.emit_chunk(error_message)
             await final_response_stream.complete()
         
         # Mark response as complete
         await response_handler.complete()
         logger.info("[RESPONSE] Author profile response handling complete")
+    
+    async def _handle_agent_info_response(
+            self,
+            result: Dict[str, Any],
+            response_handler: ResponseHandler
+    ):
+        """Handle responses about the agent itself."""
+        logger.info("[RESPONSE] Handling agent info response")
+        
+        # Create final response
+        final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+        
+        # If we have a summary, use it; otherwise create our own response
+        if "summary" in result:
+            if result.get("is_history_query", False):
+                # For history queries, add a header
+                await final_response_stream.emit_chunk("## Your Research Session History\n\n")
+            await final_response_stream.emit_chunk(result["summary"])
+        else:
+            # Create a default agent info response
+            agent_info = """
+            # arXiv Research Agent
 
+            I'm an AI assistant specialized in helping you navigate academic research from arXiv. I can:
+
+            1. Search for papers on specific topics
+            2. Provide detailed summaries and information about specific papers
+            3. Find and analyze an author's research profile and publications
+            4. Explain academic concepts and provide context for research fields
+            5. Answer follow-up questions about papers and research topics
+            6. Track your research session and summarize what you've explored
+
+            Just ask me to find papers on a topic you're interested in, get details about a specific paper, or learn about a researcher's work. I can also discuss general academic concepts to help you understand research better.
+            """
+            
+            await final_response_stream.emit_chunk(agent_info)
+        
+        await final_response_stream.complete()
+        
+        # Mark response as complete
+        await response_handler.complete()
+        logger.info("[RESPONSE] Agent info response handling complete")
+    
+    async def _handle_greeting_response(
+            self,
+            greeting: str,
+            response_handler: ResponseHandler
+    ):
+        """Handle greeting responses."""
+        logger.info("[RESPONSE] Handling greeting response")
+        
+        # Create final response
+        final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+        
+        # Generate a friendly greeting
+        try:
+            task_instructions = """
+            Respond to greetings with a friendly, professional welcome that introduces your capabilities.
+            Keep responses concise and encourage research exploration.
+            """
+            
+            user_prompt = f"""
+            The user has greeted you with: "{greeting}"
+            
+            Generate a friendly, professional response that:
+            1. Acknowledges their greeting
+            2. Briefly introduces that you are an arXiv research assistant
+            3. Mentions 2-3 key things you can help with
+            4. Invites them to start researching
+            5. Keeps the tone scholarly but conversational
+            """
+            
+            response = await self._model_provider.query(user_prompt, task_instructions)
+            filtered_response = self._filter_inappropriate_content(response)
+            
+            await final_response_stream.emit_chunk(filtered_response)
+        except Exception as e:
+            logger.error(f"[RESPONSE] Error generating greeting response: {str(e)}")
+            
+            # Fallback greeting
+            greeting_resp = "Hello! I'm your arXiv research assistant. I can help you search for academic papers, get details about specific research, and explore authors' publication history. What topic would you like to explore today?"
+            
+            await final_response_stream.emit_chunk(greeting_resp)
+        
+        await final_response_stream.complete()
+        
+        # Mark response as complete
+        await response_handler.complete()
+        logger.info("[RESPONSE] Greeting response handling complete")
+        
+    async def _handle_explanation_response(
+            self,
+            result: Dict[str, Any],
+            response_handler: ResponseHandler,
+            session: Session
+    ):
+        """Handle responses for general explanations and academic discussions."""
+        logger.info("[RESPONSE] Handling explanation response")
+        
+        query = result["query"]
+        explanation = result["explanation"]
+        related_papers = result.get("related_papers", [])
+        
+        # Emit any related papers as JSON if available
+        if related_papers:
+            await response_handler.emit_json(
+                "RELATED_PAPERS", {"results": related_papers}
+            )
+            logger.info(f"[RESPONSE] Emitted {len(related_papers)} related papers as JSON")
+        
+        # Create final response
+        final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+        
+        # Use the explanation from the result
+        await final_response_stream.emit_chunk(explanation)
+        
+        # If we have related papers, add a note about them
+        if related_papers:
+            paper_note = "\n\nRelated papers from arXiv:\n\n"
+            
+            for i, paper in enumerate(related_papers[:3]):
+                paper_note += f"{i+1}. \"{paper.get('title')}\" by {', '.join(paper.get('authors', [])[:2])}"
+                if len(paper.get('authors', [])) > 2:
+                    paper_note += " et al."
+                paper_note += f" ({paper.get('published', '').split('T')[0]})\n"
+            
+            paper_note += "\nYou can ask for more details about any of these papers if you're interested."
+            
+            await final_response_stream.emit_chunk(paper_note)
+        
+        await final_response_stream.complete()
+        
+        # Mark response as complete
+        await response_handler.complete()
+        logger.info("[RESPONSE] Explanation response handling complete")
+
+    async def _handle_error_response(
+            self,
+            error_message: str,
+            response_handler: ResponseHandler
+    ):
+        """Handle error responses."""
+        logger.error(f"[RESPONSE] Error response: {error_message}")
+        
+        await response_handler.emit_text_block(
+            "ERROR", error_message
+        )
+        
+        # Create final response
+        final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
+        
+        # Create a more helpful error message
+        try:
+            task_instructions = """
+            Create helpful, friendly error messages that guide users toward successful interactions.
+            Provide suggestions for alternative approaches.
+            """
+            
+            user_prompt = f"""
+            There was an error with the user's request: "{error_message}"
+            
+            Generate a helpful response that:
+            1. Acknowledges the issue in a professional way
+            2. Explains what might have gone wrong
+            3. Provides 1-2 specific suggestions for resolving it
+            4. Maintains a scholarly but encouraging tone
+            """
+            
+            response = await self._model_provider.query(user_prompt, task_instructions)
+            filtered_response = self._filter_inappropriate_content(response)
+            
+            await final_response_stream.emit_chunk(filtered_response)
+        except Exception as e:
+            logger.error(f"[RESPONSE] Error generating error response: {str(e)}")
+            
+            # Fallback error message
+            error_resp = f"I encountered a problem: {error_message}. Please try phrasing your request differently or try a different search term."
+            
+            await final_response_stream.emit_chunk(error_resp)
+        
+        await final_response_stream.complete()
+        
+        # Mark response as complete
+        await response_handler.complete()
+        logger.info("[RESPONSE] Error response handling complete")
+    
     async def _generate_author_summary(
             self,
             profile: Dict[str, Any]
     ) -> AsyncIterator[str]:
         """Generate a comprehensive summary of an author's research profile."""
-        
-        author_name = profile["name"]
-        paper_count = profile["paper_count"]
-        research_interests = profile["research_interests"]
-        papers = profile["papers"]
-        timeline = profile["publication_timeline"]
+        author_name = profile.get("name", "")
+        papers = profile.get("papers", [])
+        research_interests = profile.get("research_interests", [])
+        publication_timeline = profile.get("publication_timeline", [])
+        co_authors = profile.get("co_authors", [])
         
         logger.info(f"[SUMMARY] Generating author summary for {author_name}")
         
-        # Extract research interest categories
-        top_categories = [item['category'] for item in research_interests[:5]]
-        
-        # Format recent papers for the summary
-        recent_papers_text = "\n\n".join([
-            f"Paper {i+1}:\n"
-            f"Title: {paper['title']}\n"
-            f"Published: {paper['published']}\n"
-            f"Categories: {', '.join(paper['categories'])}\n"
-            f"Summary: {paper['summary'][:200]}..."
-            for i, paper in enumerate(papers[:5])
-        ])
-        
-        # Create publication timeline summary
-        timeline_str = ", ".join([f"{item['year']}: {item['papers']} papers" for item in timeline])
-        
-        prompt = f"""
-        Generate a comprehensive academic profile for author {author_name}.
-        
-        Profile data:
-        - Total publications found: {paper_count}
-        - Research areas: {', '.join(top_categories)}
-        - Publication timeline: {timeline_str}
-        
-        Recent papers:
-        {recent_papers_text}
-        
-        Please provide:
-        1. An overview of the author's research focus and expertise
-        2. Analysis of their research trajectory and evolution over time
-        3. Description of their publication impact and contributions to the field
-        4. Brief summary of their most recent or significant work
-        
-        Use formal academic language appropriate for researchers.
+        # Build a prompt for the LLM
+        task_instructions = """
+        Generate comprehensive academic author profiles based on publication data.
+        Focus on research trends, contributions, and scholarly connections.
         """
         
-        system_prompt = (
-            "You are a professional academic research assistant specializing in researcher profiles. "
-            "You analyze publication patterns to create insightful, objective summaries of "
-            "researchers' work and contributions. Your summaries highlight research focus, "
-            "methodological approaches, and key contributions. You maintain scholarly "
-            "objectivity while providing valuable context about the researcher's significance."
-        )
+        user_prompt = f"""
+        Create a detailed academic profile for {author_name} based on these publications:
         
-        logger.info(f"[SUMMARY] Sending prompt of length {len(prompt)} to model")
+        Papers ({len(papers)} total):
+        {json.dumps([{
+            "title": p.get("title", ""),
+            "published": p.get("published", ""),
+            "categories": p.get("categories", []),
+            "summary": p.get("summary", "")[:100] + "..." if p.get("summary") and len(p.get("summary", "")) > 100 else p.get("summary", "")
+        } for p in papers[:5]], indent=2)}
+        
+        Research Areas:
+        {json.dumps(research_interests, indent=2)}
+        
+        Publication Timeline:
+        {json.dumps(publication_timeline, indent=2)}
+        
+        Collaborators:
+        {json.dumps(co_authors[:5], indent=2)}
+        
+        Include:
+        1. Research focus overview
+        2. Publication trend analysis
+        3. Key papers and contributions
+        4. Research evolution over time (if evident)
+        5. Collaborative network insights
+        6. Field impact assessment
+        
+        Use formal academic language appropriate for research contexts.
+        """
         
         try:
-            async for chunk in self._model_provider.query_stream(prompt, system_prompt):
+            # Call the model to generate author summary
+            async for chunk in self._model_provider.query_stream(user_prompt, task_instructions):
                 filtered_chunk = self._filter_inappropriate_content(chunk)
                 yield filtered_chunk
-            logger.info("[SUMMARY] Successfully completed author summary generation")
-        except Exception as e:
-            # Fallback for error cases
-            logger.error(f"[SUMMARY] Error generating author summary: {str(e)}")
-            logger.error(traceback.format_exc())
             
-            # Provide a simpler fallback response
-            yield f"## Author Profile: {author_name}\n\n"
+            logger.info(f"[SUMMARY] Successfully generated author summary for {author_name}")
+        except Exception as e:
+            logger.error(f"[SUMMARY] Error generating author summary: {str(e)}")
+            
+            # Fallback response
+            yield f"# {author_name}: Research Profile\n\n"
             
             # Research focus
-            yield f"{author_name} has published {paper_count} papers on arXiv"
-            if top_categories:
-                yield f", primarily in the areas of {', '.join(top_categories[:3])}.\n\n"
-            else:
-                yield ".\n\n"
+            if research_interests:
+                interests = [f"{item.get('category')} ({item.get('count')} papers)" for item in research_interests[:3]]
+                yield f"## Research Focus\n\n{author_name} primarily publishes in {', '.join(interests)}.\n\n"
             
             # Recent papers
-            yield "### Recent Publications:\n\n"
+            if papers:
+                yield "## Notable Publications\n\n"
+                for i, paper in enumerate(papers[:3]):
+                    yield f"**{i+1}. {paper.get('title')}** ({paper.get('published').split('T')[0]})\n\n"
+                    
+                    summary = paper.get('summary', '')
+                    if summary:
+                        brief_summary = summary[:150] + "..." if len(summary) > 150 else summary
+                        yield f"{brief_summary}\n\n"
             
-            for i, paper in enumerate(papers[:3]):
-                title = paper.get('title', 'Untitled')
-                published = paper.get('published', 'Unknown date')
-                
-                yield f"**{i+1}. {title}** ({published})\n\n"
-                
-                summary = paper.get('summary', '')
-                if summary:
-                    short_summary = summary[:200] + "..." if len(summary) > 200 else summary
-                    yield f"{short_summary}\n\n"
+            # Timeline
+            if publication_timeline:
+                yield "## Publication History\n\n"
+                history = ", ".join([f"{item.get('year')}: {item.get('papers')} papers" for item in publication_timeline])
+                yield f"{history}\n\n"
             
-            yield "You can request more details about any of these papers or explore other aspects of this author's work."
+            # Collaborators
+            if co_authors:
+                yield f"## Key Collaborators\n\n{', '.join(co_authors[:5])}\n\n"
+            
+            yield "You can ask for more details about any specific paper or research area."
+            
+            logger.info(f"[SUMMARY] Generated fallback author summary for {author_name}")
 
-    async def search_arxiv(self, query: str, max_results: int = 5, sort_by: str = "relevance", sort_order: str = "descending", topic: Optional[str] = None) -> Dict[str, Any]:
-        """Search arXiv for papers."""
+    async def _generate_paper_response(self, paper: Dict[str, Any], paper_id: str, session: Session) -> Dict[str, Any]:
+        """Helper method to generate paper response with summary."""
+        task_instructions = """
+        Provide detailed paper information, focusing on contributions and context.
+        Suggest related exploration options.
+        """
+        
+        user_prompt = f"""
+        Paper ID: {paper_id}
+        Title: {paper['title']}
+        Authors: {', '.join(paper['authors'])}
+        Published: {paper['published']}
+        Categories: {', '.join(paper['categories'])}
+        Abstract: {paper['summary']}
+        
+        Provide:
+        1. Brief introduction (1 sentence)
+        2. Main contributions (1-2 sentences)
+        3. Access links (arXiv URL, PDF)
+        4. Suggested exploration (e.g., author's other papers, related topics)
+        """
+        
+        summary = await self._model_provider.query(user_prompt, task_instructions)
+        filtered_summary = self._filter_inappropriate_content(summary)
+        
+        # Prepare result data
+        result_data = {
+            "type": "paper_detail",
+            "paper_id": paper_id,
+            "paper": paper,
+            "summary": filtered_summary,
+            "found": True
+        }
+        
+        # Update session state
+        await self._manage_session_state(session, "paper_detail", result_data)
+        
+        return result_data
+
+    async def _transform_query_to_search_terms(self, query: str, classification_explanation: str = None) -> str:
+        """
+        Transform a natural language query into effective search terms for arXiv
+        using arXiv's advanced query syntax.
+        
+        Args:
+            query: The original user query
+            classification_explanation: Optional explanation from query classification
+            
+        Returns:
+            Optimized search terms for arXiv API
+        """
+        logger.info(f"[TRANSFORM] Transforming query: '{query}'")
+        
+        # Skip transformation for direct paper IDs
+        if re.search(r'\d{4}\.\d{5}', query):
+            logger.info(f"[TRANSFORM] Query contains paper ID, using as is")
+            return query
+            
+        # Get current date and one year ago for date filtering
+        current_date = datetime.now().strftime("%Y%m%d")
+        one_year_ago = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+        
+        task_instructions = """
+        Convert natural language questions into effective arXiv API search terms.
+        Your job is to create the most effective arXiv search string that will return relevant papers.
+        This MUST include special handling for recency, ensuring all temporal queries return recent papers.
+        """
+        
+        user_prompt = f"""
+        Original query: "{query}"
+        """
+        
+        # Add classification explanation context if available
+        if classification_explanation:
+            user_prompt += f"""
+            Query classification: "{classification_explanation}"
+            """
+            logger.info(f"[TRANSFORM] Including classification explanation: '{classification_explanation}'")
+        
+        user_prompt += f"""
+        Convert this query into effective search terms for the arXiv API using their specific query syntax.
+        
+        arXiv search field prefixes:
+        - ti: for title search (e.g., ti:quantum)
+        - au: for author search (e.g., au:smith)
+        - abs: for abstract search (e.g., abs:machine learning)
+        - co: for comment field search
+        - jr: for journal reference search
+        - cat: for category search (e.g., cat:cs.AI)
+        - all: for searching all fields
+        - submittedDate: for date range in format [YYYYMMDD TO YYYYMMDD]
+        
+        Boolean operators: AND, OR, ANDNOT (must be capitalized)
+        Grouping: Use parentheses (e.g., (ti:quantum OR ti:algorithm) AND au:smith)
+        
+        IMPORTANT GUIDELINES:
+        - For ANY query related to recent, latest, or current research:
+          - ALWAYS include this date filter: submittedDate:[{one_year_ago} TO {current_date}]
+        
+        - Keep searches balanced between specific and broad:
+          - Use OR between similar terms (e.g., quantum OR "quantum mechanics")
+          - Use AND between different concepts (e.g., quantum AND computing)
+          - Include both title (ti:) and abstract (abs:) searches for key terms
+        
+        - Format date ranges exactly as: submittedDate:[YYYYMMDD TO YYYYMMDD]
+        
+        Examples:
+        Query: "What are recent advances in quantum computing?"
+        Search terms: (ti:quantum OR abs:quantum) AND (ti:computing OR abs:computing) AND submittedDate:[{one_year_ago} TO {current_date}]
+        
+        Query: "Latest research on CRISPR gene editing"
+        Search terms: (CRISPR OR "gene editing") AND submittedDate:[{one_year_ago} TO {current_date}]
+        
+        Query: "What is reinforcement learning?"
+        Search terms: "reinforcement learning" AND (introduction OR overview OR survey)
+        
+        RETURN ONLY THE SEARCH TERMS. NO OTHER TEXT OR EXPLANATION.
+        """
+        
         try:
-            # If topic and query are the same, use only the query
-            if topic and topic.lower() == query.lower():
-                logger.info("[SEARCH] Topic and query are identical, using only query")
-                topic = None
+            response = await self._model_provider.query(user_prompt, task_instructions)
             
-            # Build search query
-            search_query = query
-            if topic:
-                search_query = f"cat:{topic} AND {query}"
+            # Clean the response
+            response = response.strip()
+            if response.lower().startswith("search terms:"):
+                response = response[len("search terms:"):].strip()
+                
+            # Handle quotes properly
+            response = response.replace('\\"', '"').replace("\\'", "'")
             
-            logger.info(f"[SEARCH] Executing search with query: {search_query}")
+            # Ensure proper date format for submittedDate
+            if "submittedDate:[" in response:
+                # Remove any time components to keep format simple
+                date_pattern = r'submittedDate:\[(\d{8})(\d{4})?(\s+TO\s+|\+TO\+)(\d{8})(\d{4})?\]'
+                date_match = re.search(date_pattern, response)
+                
+                if date_match:
+                    start_date = date_match.group(1)
+                    end_date = date_match.group(4)
+                    
+                    # Reconstruct with standard format without time components
+                    new_date_range = f"submittedDate:[{start_date} TO {end_date}]"
+                    response = re.sub(date_pattern, new_date_range, response)
+                
+                # Replace any remaining space-based TO with standard format
+                response = response.replace("+TO+", " TO ")
             
-            # Execute search
-            search = arxiv.Search(
-                query=search_query,
-                max_results=max_results,
-                sort_by=arxiv.SortCriterion.RELEVANCE if sort_by == "relevance" else arxiv.SortCriterion.LAST_UPDATED_DATE,
-                sort_order=arxiv.SortOrder.DESCENDING if sort_order == "descending" else arxiv.SortOrder.ASCENDING
-            )
+            # Ensure response isn't too long
+            if len(response) > 500:
+                logger.warning(f"[TRANSFORM] Transformed query too long: '{response}', trimming")
+                response = response[:500]
             
-            results = []
-            async for result in search.results():
-                paper = {
-                    "id": result.entry_id.split('/')[-1],
-                    "title": result.title,
-                    "authors": [author.name for author in result.authors],
-                    "summary": result.summary,
-                    "published": result.published.isoformat(),
-                    "updated": result.updated.isoformat(),
-                    "pdf_url": result.pdf_url,
-                    "primary_category": result.primary_category,
-                    "categories": result.categories,
-                    "comment": result.comment,
-                    "doi": result.doi,
-                    "journal_ref": result.journal_ref
-                }
-                results.append(paper)
-            
-            return {
-                "status": "success",
-                "query": search_query,
-                "results": results,
-                "count": len(results)
-            }
-            
+            # If response is empty, use original query
+            if not response:
+                logger.warning(f"[TRANSFORM] Empty transformed query, using original")
+                return query
+                
+            logger.info(f"[TRANSFORM] Successfully transformed query to: '{response}'")
+            return response
         except Exception as e:
-            logger.error(f"[SEARCH] Error searching arXiv: {str(e)}")
-            return {
-                "status": "error",
-                "error": str(e)
-            }
+            logger.error(f"[TRANSFORM] Error transforming query: {str(e)}")
+            return query  # Fall back to original query on error
 
 
 # Modified DefaultServer implementation that properly manages sessions
